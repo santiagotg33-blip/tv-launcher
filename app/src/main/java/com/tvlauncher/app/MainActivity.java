@@ -1,8 +1,10 @@
 package com.tvlauncher.app;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Canvas;
@@ -11,6 +13,7 @@ import android.graphics.LinearGradient;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.PorterDuff;
 import android.graphics.Rect;
 import android.graphics.Shader;
 import android.graphics.Typeface;
@@ -34,6 +37,7 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -44,13 +48,26 @@ public class MainActivity extends Activity {
     // Texto grande de arriba a la izquierda
     private static final String TITLE = "Bienvenidos";
 
-    // Fila principal, de izquierda a derecha (se busca por nombre visible)
+    // Fila principal la PRIMERA vez (despues la cambias desde el TV
+    // manteniendo pulsado OK sobre una app)
     private static final String[] DOCK = {"magma", "kodi", "youtube", "aptoide tv"};
 
     private PackageManager pm;
     private float unit; // pixeles por "pixel de 1080p"
     private TextView dateView;
     private final Handler handler = new Handler();
+
+    private List<String> pinnedNow = new ArrayList<>();
+    private final Map<String, View> tiles = new HashMap<>();
+    private String focusPkg = null;
+
+    private static class Item {
+        Drawable icon;
+        String name;
+        String key;
+        Runnable click;
+        Runnable longClick;
+    }
 
     private final Runnable tick = new Runnable() {
         @Override
@@ -88,6 +105,109 @@ public class MainActivity extends Activity {
         return r.loadLabel(pm).toString();
     }
 
+    private String pkgOf(ResolveInfo r) {
+        return r.activityInfo.packageName;
+    }
+
+    // ------------------------------------------------------ Preferencias
+    private SharedPreferences prefs() {
+        return getSharedPreferences("launcher", MODE_PRIVATE);
+    }
+
+    private List<String> readList(String key) {
+        List<String> l = new ArrayList<>();
+        String s = prefs().getString(key, "");
+        if (s != null && s.length() > 0) {
+            for (String x : s.split(",")) {
+                if (x.length() > 0) l.add(x);
+            }
+        }
+        return l;
+    }
+
+    private void saveList(String key, List<String> l) {
+        prefs().edit().putString(key, TextUtils.join(",", l)).apply();
+    }
+
+    // ----------------------------------------------------------- Acciones
+    private void setPinned(String pkg, boolean on) {
+        List<String> l = new ArrayList<>(pinnedNow);
+        l.remove(pkg);
+        if (on) l.add(pkg);
+        saveList("pinned", l);
+        focusPkg = pkg;
+        build();
+    }
+
+    private void movePinned(String pkg, int delta) {
+        List<String> l = new ArrayList<>(pinnedNow);
+        int i = l.indexOf(pkg);
+        int j = i + delta;
+        if (i < 0 || j < 0 || j >= l.size()) return;
+        Collections.swap(l, i, j);
+        saveList("pinned", l);
+        focusPkg = pkg;
+        build();
+    }
+
+    private void hide(String pkg) {
+        List<String> h = readList("hidden");
+        if (!h.contains(pkg)) h.add(pkg);
+        saveList("hidden", h);
+        focusPkg = null;
+        build();
+    }
+
+    private void unhide(String pkg) {
+        List<String> h = readList("hidden");
+        h.remove(pkg);
+        saveList("hidden", h);
+        focusPkg = pkg;
+        build();
+    }
+
+    private void showMenu(final ResolveInfo r) {
+        final String pkg = pkgOf(r);
+        final List<String> items = new ArrayList<>();
+        final List<Runnable> acts = new ArrayList<>();
+
+        if (pinnedNow.contains(pkg)) {
+            int idx = pinnedNow.indexOf(pkg);
+            items.add("Quitar de la fila principal");
+            acts.add(() -> setPinned(pkg, false));
+            if (idx > 0) {
+                items.add("Mover a la izquierda");
+                acts.add(() -> movePinned(pkg, -1));
+            }
+            if (idx < pinnedNow.size() - 1) {
+                items.add("Mover a la derecha");
+                acts.add(() -> movePinned(pkg, 1));
+            }
+        } else {
+            items.add("Poner en la fila principal");
+            acts.add(() -> setPinned(pkg, true));
+        }
+        items.add("Ocultar app");
+        acts.add(() -> hide(pkg));
+
+        new AlertDialog.Builder(this)
+                .setTitle(label(r))
+                .setItems(items.toArray(new String[0]), (d, i) -> acts.get(i).run())
+                .show();
+    }
+
+    private void showHidden(final List<ResolveInfo> hiddenApps) {
+        String[] names = new String[hiddenApps.size()];
+        for (int i = 0; i < names.length; i++) {
+            names[i] = label(hiddenApps.get(i));
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Elige una app para volver a mostrarla")
+                .setItems(names, (d, i) -> unhide(pkgOf(hiddenApps.get(i))))
+                .show();
+    }
+
+    // -------------------------------------------------------------- Datos
     private void updateDate() {
         if (dateView == null) return;
         String s = new SimpleDateFormat("EEEE, d 'de' MMMM", new Locale("es")).format(new Date());
@@ -102,7 +222,7 @@ public class MainActivity extends Activity {
             Intent i = new Intent(Intent.ACTION_MAIN);
             i.addCategory(cat);
             for (ResolveInfo r : pm.queryIntentActivities(i, 0)) {
-                String pkg = r.activityInfo.packageName;
+                String pkg = pkgOf(r);
                 if (pkg.equals(getPackageName())) continue;
                 if (!map.containsKey(pkg)) map.put(pkg, r);
             }
@@ -122,25 +242,91 @@ public class MainActivity extends Activity {
         return null;
     }
 
+    private ResolveInfo byPackage(List<ResolveInfo> apps, String pkg) {
+        for (ResolveInfo r : apps) {
+            if (pkgOf(r).equals(pkg)) return r;
+        }
+        return null;
+    }
+
+    private Item item(final ResolveInfo r) {
+        Item it = new Item();
+        it.icon = r.loadIcon(pm);
+        it.name = label(r);
+        it.key = pkgOf(r);
+        it.click = () -> launch(r);
+        it.longClick = () -> showMenu(r);
+        return it;
+    }
+
+    // ----------------------------------------------------------------- UI
     // Fondo blanco con el Everest en blancos y grises muy suaves
     private Drawable background() {
         return new MountainDrawable();
     }
 
     private void build() {
-        List<ResolveInfo> apps = loadApps();
-        List<ResolveInfo> dock = new ArrayList<>();
-        for (String key : DOCK) {
-            ResolveInfo r = find(apps, key);
-            if (r != null) {
-                dock.add(r);
-                apps.remove(r);
+        tiles.clear();
+
+        List<ResolveInfo> all = loadApps();
+        List<String> hiddenPkgs = readList("hidden");
+        List<ResolveInfo> visible = new ArrayList<>();
+        final List<ResolveInfo> hiddenApps = new ArrayList<>();
+        for (ResolveInfo r : all) {
+            if (hiddenPkgs.contains(pkgOf(r))) {
+                hiddenApps.add(r);
+            } else {
+                visible.add(r);
             }
+        }
+
+        // Fila principal: la guardada, o la de fabrica la primera vez
+        List<ResolveInfo> dock = new ArrayList<>();
+        if (prefs().contains("pinned")) {
+            for (String pkg : readList("pinned")) {
+                ResolveInfo r = byPackage(visible, pkg);
+                if (r != null) dock.add(r);
+            }
+        } else {
+            List<ResolveInfo> pool = new ArrayList<>(visible);
+            for (String key : DOCK) {
+                ResolveInfo r = find(pool, key);
+                if (r != null) {
+                    dock.add(r);
+                    pool.remove(r);
+                }
+            }
+        }
+        visible.removeAll(dock);
+
+        pinnedNow = new ArrayList<>();
+        List<Item> dockItems = new ArrayList<>();
+        for (ResolveInfo r : dock) {
+            pinnedNow.add(pkgOf(r));
+            dockItems.add(item(r));
+        }
+
+        List<Item> appItems = new ArrayList<>();
+        for (ResolveInfo r : visible) {
+            appItems.add(item(r));
+        }
+        if (!hiddenApps.isEmpty()) {
+            Item h = new Item();
+            h.icon = getDrawable(android.R.drawable.ic_menu_manage);
+            if (h.icon != null) {
+                h.icon = h.icon.mutate();
+                h.icon.setColorFilter(0xFF6E6E73, PorterDuff.Mode.SRC_IN);
+            }
+            h.name = "Ocultas (" + hiddenApps.size() + ")";
+            h.key = null;
+            h.click = () -> showHidden(hiddenApps);
+            h.longClick = null;
+            appItems.add(h);
         }
 
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
-        page.setPadding(px(90), px(60), px(90), px(50));
+        page.setPadding(px(90), px(60), px(90), px(40));
         page.setClipChildren(false);
         page.setClipToPadding(false);
         page.setBackground(background());
@@ -180,19 +366,32 @@ public class MainActivity extends Activity {
 
         View firstFocus = null;
 
-        if (!dock.isEmpty()) {
-            HorizontalScrollView dockStrip = strip(dock, px(190), px(28), 0);
+        if (!dockItems.isEmpty()) {
+            HorizontalScrollView dockStrip = strip(dockItems, px(190), px(28), 0);
             page.addView(dockStrip);
             firstFocus = firstTile(dockStrip);
         }
-        if (!apps.isEmpty()) {
-            HorizontalScrollView appsStrip = strip(apps, px(130), px(24), px(8));
+        if (!appItems.isEmpty()) {
+            HorizontalScrollView appsStrip = strip(appItems, px(130), px(24), px(8));
             page.addView(appsStrip);
             if (firstFocus == null) firstFocus = firstTile(appsStrip);
         }
 
+        TextView hint = text("Mant\u00e9n pulsado OK sobre una app para moverla u ocultarla",
+                px(22), 0xFF9A9AA0);
+        hint.setGravity(Gravity.CENTER_HORIZONTAL);
+        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hlp.topMargin = px(12);
+        page.addView(hint, hlp);
+
         setContentView(page);
-        if (firstFocus != null) firstFocus.requestFocus(); // Magma
+        updateDate();
+
+        View target = (focusPkg != null) ? tiles.get(focusPkg) : null;
+        focusPkg = null;
+        if (target == null) target = firstFocus;
+        if (target != null) target.requestFocus();
     }
 
     private View firstTile(HorizontalScrollView hs) {
@@ -200,7 +399,7 @@ public class MainActivity extends Activity {
         return row.getChildAt(0);
     }
 
-    private HorizontalScrollView strip(List<ResolveInfo> list, int size, int textPx, int topMargin) {
+    private HorizontalScrollView strip(List<Item> list, int size, int textPx, int topMargin) {
         HorizontalScrollView hs = new HorizontalScrollView(this);
         hs.setHorizontalScrollBarEnabled(false);
         hs.setClipChildren(false);
@@ -210,8 +409,8 @@ public class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setClipChildren(false);
-        for (ResolveInfo r : list) {
-            row.addView(tile(r, size, textPx));
+        for (Item it : list) {
+            row.addView(tile(it, size, textPx));
         }
         hs.addView(row);
 
@@ -239,7 +438,7 @@ public class MainActivity extends Activity {
     }
 
     // Icono cuadrado redondeado; el nombre aparece debajo solo al seleccionar
-    private View tile(final ResolveInfo r, int size, int textPx) {
+    private View tile(final Item it, int size, int textPx) {
         int radius = Math.round(size * 0.22f);
         final GradientDrawable normal = shape(0x14000000, 0, radius);
         final GradientDrawable focused = shape(0x26000000, 0xFF1D1D1F, radius);
@@ -257,13 +456,13 @@ public class MainActivity extends Activity {
         box.setPadding(pad, pad, pad, pad);
 
         ImageView iv = new ImageView(this);
-        iv.setImageDrawable(r.loadIcon(pm));
+        iv.setImageDrawable(it.icon);
         iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
         box.addView(iv, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         t.addView(box, new LinearLayout.LayoutParams(size, size));
 
-        final TextView name = text(label(r), textPx, 0xFF1D1D1F);
+        final TextView name = text(it.name, textPx, 0xFF1D1D1F);
         name.setSingleLine(true);
         name.setEllipsize(TextUtils.TruncateAt.END);
         name.setGravity(Gravity.CENTER);
@@ -284,7 +483,18 @@ public class MainActivity extends Activity {
             box.animate().scaleX(s).scaleY(s).setDuration(130).start();
             name.setVisibility(has ? View.VISIBLE : View.INVISIBLE);
         });
-        t.setOnClickListener(v -> launch(r));
+        t.setOnClickListener(v -> {
+            if (it.click != null) it.click.run();
+        });
+        t.setOnLongClickListener(v -> {
+            if (it.longClick != null) {
+                it.longClick.run();
+                return true;
+            }
+            return false;
+        });
+
+        if (it.key != null) tiles.put(it.key, t);
         return t;
     }
 
