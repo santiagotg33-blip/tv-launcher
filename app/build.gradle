@@ -1,35 +1,14 @@
-plugins {
-    id 'com.android.application'
-}
-
+plugins { id 'com.android.application' }
 android {
-    namespace 'com.tvlauncher.app'
+    namespace 'com.tvlauncher'
     compileSdk 34
-
-    signingConfigs {
-        fijo {
-            storeFile file('tv.keystore')
-            storePassword 'android'
-            keyAlias 'androiddebugkey'
-            keyPassword 'android'
-            storeType 'pkcs12'
-        }
-    }
-
     defaultConfig {
-        applicationId 'com.tvlauncher.app'
+        applicationId 'com.tvlauncher'
         minSdk 21
-        targetSdk 34
-        versionCode 3
-        versionName '3.0'
+        targetSdk 25
+        versionCode 1
+        versionName '1.0'
     }
-
-    buildTypes {
-        debug {
-            signingConfig signingConfigs.fijo
-        }
-    }
-
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
