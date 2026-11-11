@@ -1,14 +1,15 @@
 package com.tvlauncher;
 
 public class Config {
-    // Dock: paquetes en orden, de izquierda a derecha (maximo 4)
+    // Paquetes que apareceran por defecto en el Dock inferior si no hay estado guardado
     public static final String[] DOCK = {
-        "com.magmaplayer",
-        "org.xbmc.kodi",
-        "com.google.android.youtube.tv",
-        "cm.aptoidetv.pt.top_tech"
+        "com.magmastream.player", 
+        "org.xbmc.kodi", 
+        "com.magis.tv"
     };
-    // Paquetes que NO quieres ver en la cuadricula
+
+    // Paquetes o aplicaciones que deseas ocultar del grid principal por defecto
     public static final String[] HIDE = {
+        // "com.android.settings",
     };
 }

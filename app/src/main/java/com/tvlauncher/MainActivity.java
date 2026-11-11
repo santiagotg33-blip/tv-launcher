@@ -130,7 +130,6 @@ public class MainActivity extends Activity {
         updateFocus();
     }
 
-    // ---------- helpers ----------
     Typeface loadFace() {
         try { return Typeface.createFromAsset(getAssets(), "fonts/chubby.ttf"); }
         catch (Throwable t) { return Typeface.create("sans-serif-black", Typeface.NORMAL); }
@@ -194,7 +193,6 @@ public class MainActivity extends Activity {
         return 0xFF4A90E2;
     }
 
-    // ---------- orden y estado guardados ----------
     String[] parts(String s) {
         if (s == null || s.length() == 0) return new String[0];
         return s.split(",");
@@ -226,7 +224,6 @@ public class MainActivity extends Activity {
         prefs.edit().putString("dock_list", join(dock)).putString("grid_order", join(grid)).apply();
     }
 
-    // ---------- apps ----------
     void loadApps() {
         PackageManager pm = getPackageManager();
         LinkedHashMap<String, App> map = new LinkedHashMap<String, App>();
@@ -291,7 +288,6 @@ public class MainActivity extends Activity {
         gridIdx = clampi(gridIdx, 0, Math.max(0, grid.size() - 1));
     }
 
-    // ---------- UI ----------
     ImageView tile(App a, final int rad) {
         ImageView iv = new ImageView(this);
         iv.setImageDrawable(a.img);
@@ -471,7 +467,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------- focus ----------
     void updateFocus() {
         for (View v : dockViews) v.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
         for (View v : gridViews) v.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
@@ -566,7 +561,6 @@ public class MainActivity extends Activity {
         updateFocus();
     }
 
-    // ---------- modo mover ----------
     void startMove() {
         if (zone == TOP || menuOpen) return;
         if (zone == DOCK && dock.isEmpty()) return;
@@ -606,7 +600,6 @@ public class MainActivity extends Activity {
         updateFocus();
     }
 
-    // ---------- acciones del menu contextual ----------
     void addToDock() {
         App a = grid.get(gridIdx);
         a.glow = avgColor(a.img);
@@ -675,7 +668,6 @@ public class MainActivity extends Activity {
         showPanel(true);
     }
 
-    // ---------- actividad de botones ----------
     void activate() {
         if (zone == TOP) {
             if (topIdx == 0) openMenu();
@@ -696,7 +688,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------- menu de entradas ----------
     void openMenu() {
         entries.clear();
         try {
@@ -788,7 +779,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------- teclas ----------
     @Override public boolean dispatchKeyEvent(KeyEvent e) {
         int k = e.getKeyCode();
         boolean center = k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER
