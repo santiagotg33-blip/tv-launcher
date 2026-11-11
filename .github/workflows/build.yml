@@ -10,6 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Descargar fuente chubby
+        run: |
+          mkdir -p app/src/main/assets/fonts
+          curl -fL -o app/src/main/assets/fonts/chubby.ttf "https://github.com/google/fonts/raw/main/ofl/lilitaone/LilitaOne-Regular.ttf" || true
+          [ -s app/src/main/assets/fonts/chubby.ttf ] || { rm -f app/src/main/assets/fonts/chubby.ttf; echo "Sin fuente: se usara Heavy"; }
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

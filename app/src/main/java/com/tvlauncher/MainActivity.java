@@ -41,6 +41,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -49,7 +50,7 @@ public class MainActivity extends Activity {
     static final int TOP = 0, DOCK = 1, GRID = 2;
 
     static class App { String pkg, label; Drawable img; boolean banner; Intent launch; int glow; }
-    static class Entry { String label; Intent intent; Intent fallback; }
+    static class Entry { String label; Intent intent; Intent fallback; Runnable action; }
 
     int W, H;
     float u;
@@ -66,7 +67,12 @@ public class MainActivity extends Activity {
     final List<TextView> menuRows = new ArrayList<TextView>();
     int zone = DOCK, topIdx = 0, dockIdx = 0, gridIdx = 0, menuIdx = 0;
     boolean menuOpen = false;
+    boolean moving = false, centerDown = false, longFired = false;
+    int hiddenInstalled = 0;
     int gridTop, pitch;
+    int cell, tw, th, bandX, bandY, bandH, gcw, gtw, gth, gx0;
+    GradientDrawable glassNormalBg, glassMoveBg;
+    Typeface face;
     String lastNet = "";
     final Handler handler = new Handler(Looper.getMainLooper());
     SharedPreferences prefs;
@@ -76,6 +82,11 @@ public class MainActivity extends Activity {
     final Runnable tick = new Runnable() {
         public void run() { updateClock(); handler.postDelayed(this, 15000); }
     };
+    final Runnable longPress = new Runnable() {
+        public void run() {
+            if (centerDown) { longFired = true; openContextMenu(); }
+        }
+    };
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -84,6 +95,7 @@ public class MainActivity extends Activity {
         topIdx = prefs.getInt("top", 0);
         dockIdx = prefs.getInt("dock", 0);
         gridIdx = prefs.getInt("grid", 0);
+        face = loadFace();
         buildUi();
         pkgReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context c, Intent i) {
@@ -100,7 +112,11 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onResume() { super.onResume(); handler.post(tick); }
-    @Override protected void onPause() { super.onPause(); handler.removeCallbacks(tick); }
+    @Override protected void onPause() {
+        super.onPause();
+        handler.removeCallbacks(tick);
+        handler.removeCallbacks(longPress);
+    }
     @Override protected void onDestroy() {
         super.onDestroy();
         try { unregisterReceiver(pkgReceiver); } catch (Throwable t) { }
@@ -109,11 +125,17 @@ public class MainActivity extends Activity {
     @Override protected void onNewIntent(Intent i) {
         super.onNewIntent(i);
         if (menuOpen) closeMenu();
+        if (moving) { moving = false; saveState(); }
         if (!dock.isEmpty()) zone = DOCK;
         updateFocus();
     }
 
     // ---------- helpers ----------
+    Typeface loadFace() {
+        try { return Typeface.createFromAsset(getAssets(), "fonts/chubby.ttf"); }
+        catch (Throwable t) { return Typeface.create("sans-serif-black", Typeface.NORMAL); }
+    }
+
     int px(float v) { return Math.round(v * u); }
 
     FrameLayout.LayoutParams lp(int w, int h, int x, int y) {
@@ -135,7 +157,7 @@ public class MainActivity extends Activity {
         TextView t = new TextView(this);
         t.setTextSize(TypedValue.COMPLEX_UNIT_PX, sizePx);
         t.setTextColor(color);
-        t.setTypeface(Typeface.create(family, Typeface.NORMAL));
+        t.setTypeface(face);
         t.setIncludeFontPadding(false);
         t.setSingleLine(true);
         return t;
@@ -172,6 +194,38 @@ public class MainActivity extends Activity {
         return 0xFF4A90E2;
     }
 
+    // ---------- orden y estado guardados ----------
+    String[] parts(String s) {
+        if (s == null || s.length() == 0) return new String[0];
+        return s.split(",");
+    }
+
+    List<App> applyOrder(List<App> list, String saved) {
+        if (saved == null || saved.length() == 0) return list;
+        List<App> res = new ArrayList<App>();
+        List<App> left = new ArrayList<App>(list);
+        for (String p : saved.split(",")) {
+            for (int i = 0; i < left.size(); i++) {
+                if (left.get(i).pkg.equals(p)) { res.add(left.remove(i)); break; }
+            }
+        }
+        res.addAll(left);
+        return res;
+    }
+
+    String join(List<App> l) {
+        StringBuilder sb = new StringBuilder();
+        for (App a : l) {
+            if (sb.length() > 0) sb.append(',');
+            sb.append(a.pkg);
+        }
+        return sb.toString();
+    }
+
+    void saveState() {
+        prefs.edit().putString("dock_list", join(dock)).putString("grid_order", join(grid)).apply();
+    }
+
     // ---------- apps ----------
     void loadApps() {
         PackageManager pm = getPackageManager();
@@ -201,17 +255,32 @@ public class MainActivity extends Activity {
                 map.put(pkg, a);
             }
         }
-        for (String h : Config.HIDE) map.remove(h);
+        HashSet<String> hid = new HashSet<String>();
+        for (String h : Config.HIDE) hid.add(h);
+        hiddenInstalled = 0;
+        for (String h : parts(prefs.getString("hidden", ""))) {
+            if (map.containsKey(h)) hiddenInstalled++;
+            hid.add(h);
+        }
+        for (String h : hid) map.remove(h);
         List<App> rest = new ArrayList<App>(map.values());
-        for (String p : Config.DOCK) {
+        String[] dockPk = prefs.contains("dock_list") ? parts(prefs.getString("dock_list", "")) : Config.DOCK;
+        for (String p : dockPk) {
             if (dock.size() >= 4) break;
             App a = map.get(p);
-            if (a != null) { a.glow = avgColor(a.img); dock.add(a); rest.remove(a); }
+            if (a != null && !dock.contains(a)) {
+                a.glow = avgColor(a.img);
+                dock.add(a);
+                rest.remove(a);
+            }
         }
         Collections.sort(rest, new Comparator<App>() {
             public int compare(App x, App y) { return x.label.compareToIgnoreCase(y.label); }
         });
         grid.addAll(rest);
+        List<App> og = applyOrder(new ArrayList<App>(grid), prefs.getString("grid_order", ""));
+        grid.clear();
+        grid.addAll(og);
     }
 
     void clampState() {
@@ -238,13 +307,37 @@ public class MainActivity extends Activity {
         return iv;
     }
 
+    void placeDock(int i) {
+        View v = dockViews.get(i);
+        FrameLayout.LayoutParams l = (FrameLayout.LayoutParams) v.getLayoutParams();
+        l.leftMargin = bandX + px(20) + i * cell + (cell - tw) / 2;
+        l.topMargin = bandY + (bandH - th) / 2;
+        v.setLayoutParams(l);
+    }
+
+    void placeGrid(int i) {
+        int r = i / 4, c = i % 4;
+        int x = gx0 + c * gcw + (gcw - gtw) / 2;
+        int y = gridTop + r * pitch;
+        View v = gridViews.get(i);
+        FrameLayout.LayoutParams l = (FrameLayout.LayoutParams) v.getLayoutParams();
+        l.leftMargin = x;
+        l.topMargin = y;
+        v.setLayoutParams(l);
+        View lab = gridLabels.get(i);
+        FrameLayout.LayoutParams m = (FrameLayout.LayoutParams) lab.getLayoutParams();
+        m.leftMargin = gx0 + c * gcw;
+        m.topMargin = y + gth + px(22);
+        lab.setLayoutParams(m);
+    }
+
     void buildUi() {
         DisplayMetrics dm = getResources().getDisplayMetrics();
         W = dm.widthPixels;
         H = dm.heightPixels;
         u = H / 1080f;
         dock.clear(); grid.clear(); dockViews.clear(); gridViews.clear(); gridLabels.clear();
-        menuOpen = false; menuPanel = null; lastNet = "";
+        menuOpen = false; menuPanel = null; lastNet = ""; moving = false;
         loadApps();
         clampState();
 
@@ -275,8 +368,13 @@ public class MainActivity extends Activity {
         }
         layoutPills();
 
-        int cell = px(230), tw = px(190), th = px(107), bandW = cell * 4 + px(40), bandH = px(190);
-        int bandX = (W - bandW) / 2, bandY = H - px(250);
+        cell = px(230);
+        tw = px(190);
+        th = px(107);
+        bandH = px(190);
+        int bandW = cell * 4 + px(40);
+        bandX = (W - bandW) / 2;
+        bandY = H - px(250);
         View band = new View(this);
         band.setBackground(rounded(0x1FFFFFFF, px(48)));
         page.addView(band, lp(bandW, bandH, bandX, bandY));
@@ -287,32 +385,34 @@ public class MainActivity extends Activity {
         page.addView(dockName, lp(W, px(80), 0, bandY - px(130)));
         for (int i = 0; i < dock.size(); i++) {
             ImageView t = tile(dock.get(i), px(16));
-            int x = bandX + px(20) + i * cell + (cell - tw) / 2;
-            int y = bandY + (bandH - th) / 2;
-            page.addView(t, lp(tw, th, x, y));
+            page.addView(t, lp(tw, th, 0, 0));
             dockViews.add(t);
+            placeDock(i);
         }
 
-        int gcw = px(300), gtw = px(260), gth = px(146), gx0 = (W - gcw * 4) / 2;
+        gcw = px(300);
+        gtw = px(260);
+        gth = px(146);
+        gx0 = (W - gcw * 4) / 2;
         for (int i = 0; i < grid.size(); i++) {
-            int r = i / 4, c = i % 4;
-            int x = gx0 + c * gcw + (gcw - gtw) / 2;
-            int y = gridTop + r * pitch;
             ImageView t = tile(grid.get(i), px(18));
-            page.addView(t, lp(gtw, gth, x, y));
+            page.addView(t, lp(gtw, gth, 0, 0));
             gridViews.add(t);
             TextView l = text(px(26), Color.WHITE, "sans-serif");
             l.setText(grid.get(i).label);
             l.setGravity(Gravity.CENTER);
             l.setVisibility(View.INVISIBLE);
-            page.addView(l, lp(gcw, px(36), gx0 + c * gcw, y + gth + px(22)));
+            page.addView(l, lp(gcw, px(36), 0, 0));
             gridLabels.add(l);
+            placeGrid(i);
         }
 
-        GradientDrawable gb = rounded(0x33FFFFFF, px(24));
-        gb.setStroke(px(3), 0xAAFFFFFF);
+        glassNormalBg = rounded(0x33FFFFFF, px(24));
+        glassNormalBg.setStroke(px(3), 0xAAFFFFFF);
+        glassMoveBg = rounded(0x40FFD60A, px(26));
+        glassMoveBg.setStroke(px(4), 0xFFFFD60A);
         glass = new View(this);
-        glass.setBackground(gb);
+        glass.setBackground(glassNormalBg);
         glass.setVisibility(View.INVISIBLE);
         page.addView(glass, lp(10, 10, 0, 0));
 
@@ -379,15 +479,17 @@ public class MainActivity extends Activity {
         View target = null;
         float s = 1f;
         float pad = px(8);
+        float big = moving ? 1.2f : 1.1f;
+        if (moving) pad = px(14);
         if (zone == TOP) {
             target = pills[topIdx];
             pad = px(6);
         } else if (zone == DOCK && !dock.isEmpty()) {
             target = dockViews.get(dockIdx);
-            s = 1.1f;
+            s = big;
         } else if (zone == GRID && !grid.isEmpty()) {
             target = gridViews.get(gridIdx);
-            s = 1.1f;
+            s = big;
             gridLabels.get(gridIdx).setVisibility(View.VISIBLE);
         }
         if (target != null) {
@@ -401,6 +503,7 @@ public class MainActivity extends Activity {
             g.leftMargin = Math.round(cx - w / 2f);
             g.topMargin = Math.round(cy - h / 2f);
             glass.setLayoutParams(g);
+            glass.setBackground(moving ? glassMoveBg : glassNormalBg);
             glass.setVisibility(View.VISIBLE);
         } else {
             glass.setVisibility(View.INVISIBLE);
@@ -463,6 +566,116 @@ public class MainActivity extends Activity {
         updateFocus();
     }
 
+    // ---------- modo mover ----------
+    void startMove() {
+        if (zone == TOP || menuOpen) return;
+        if (zone == DOCK && dock.isEmpty()) return;
+        if (zone == GRID && grid.isEmpty()) return;
+        moving = true;
+        Toast.makeText(this, "Mover: usa las flechas. Pulsa OK para soltar", Toast.LENGTH_LONG).show();
+        updateFocus();
+    }
+
+    void endMove() {
+        moving = false;
+        saveState();
+        updateFocus();
+    }
+
+    void moveItem(int dx, int dy) {
+        if (zone == DOCK) {
+            if (dx == 0) return;
+            int n = dockIdx + dx;
+            if (n < 0 || n >= dock.size()) return;
+            Collections.swap(dock, dockIdx, n);
+            Collections.swap(dockViews, dockIdx, n);
+            placeDock(dockIdx);
+            placeDock(n);
+            dockIdx = n;
+        } else if (zone == GRID) {
+            int n = gridIdx + dx + dy * 4;
+            if (n < 0 || n >= grid.size()) return;
+            if (dx != 0 && n / 4 != gridIdx / 4) return;
+            Collections.swap(grid, gridIdx, n);
+            Collections.swap(gridViews, gridIdx, n);
+            Collections.swap(gridLabels, gridIdx, n);
+            placeGrid(gridIdx);
+            placeGrid(n);
+            gridIdx = n;
+        }
+        updateFocus();
+    }
+
+    // ---------- acciones del menu contextual ----------
+    void addToDock() {
+        App a = grid.get(gridIdx);
+        a.glow = avgColor(a.img);
+        if (dock.size() < 4) {
+            dock.add(a);
+            grid.remove(gridIdx);
+            dockIdx = dock.size() - 1;
+        } else {
+            App old = dock.get(3);
+            dock.set(3, a);
+            grid.set(gridIdx, old);
+            dockIdx = 3;
+        }
+        zone = DOCK;
+        saveState();
+        buildUi();
+    }
+
+    void removeFromDock() {
+        dock.remove(dockIdx);
+        saveState();
+        if (dockIdx > 0) dockIdx--;
+        zone = dock.isEmpty() ? GRID : DOCK;
+        buildUi();
+    }
+
+    void hideApp() {
+        String pkg = grid.get(gridIdx).pkg;
+        String h = prefs.getString("hidden", "");
+        prefs.edit().putString("hidden", h.length() == 0 ? pkg : h + "," + pkg).apply();
+        saveState();
+        zone = GRID;
+        buildUi();
+    }
+
+    void showHidden() {
+        prefs.edit().remove("hidden").apply();
+        buildUi();
+    }
+
+    void addEntry(String label, Runnable r) {
+        Entry e = new Entry();
+        e.label = label;
+        e.action = r;
+        entries.add(e);
+    }
+
+    void openContextMenu() {
+        if (zone == TOP || menuOpen || moving) return;
+        entries.clear();
+        if (zone == DOCK) {
+            if (dock.isEmpty()) return;
+            addEntry("Mover", new Runnable() { public void run() { startMove(); } });
+            addEntry("Quitar del dock", new Runnable() { public void run() { removeFromDock(); } });
+        } else {
+            if (grid.isEmpty()) return;
+            addEntry("Mover", new Runnable() { public void run() { startMove(); } });
+            addEntry(dock.size() < 4 ? "Agregar al dock" : "Agregar al dock (cambia la última)",
+                    new Runnable() { public void run() { addToDock(); } });
+            addEntry("Ocultar", new Runnable() { public void run() { hideApp(); } });
+        }
+        if (hiddenInstalled > 0) {
+            addEntry("Mostrar apps ocultas (" + hiddenInstalled + ")",
+                    new Runnable() { public void run() { showHidden(); } });
+        }
+        showPanel(true);
+    }
+
+    // ---------- actividad de botones ----------
     void activate() {
         if (zone == TOP) {
             if (topIdx == 0) openMenu();
@@ -512,10 +725,11 @@ public class MainActivity extends Activity {
             e.label = "Sin entradas";
             entries.add(e);
         }
-        int rowH = px(64), w = px(380);
-        FrameLayout.LayoutParams pl = (FrameLayout.LayoutParams) pills[0].getLayoutParams();
-        int x = Math.min(pl.leftMargin, W - px(40) - w);
-        int y = pl.topMargin + pl.height + px(14);
+        showPanel(false);
+    }
+
+    void showPanel(boolean centered) {
+        int rowH = px(64), w = px(centered ? 460 : 380);
         FrameLayout panel = new FrameLayout(this);
         panel.setBackground(rounded(0xF0242428, px(28)));
         menuRows.clear();
@@ -527,7 +741,15 @@ public class MainActivity extends Activity {
             panel.addView(r, lp(w - px(24), rowH, px(12), px(12) + i * rowH));
             menuRows.add(r);
         }
-        page.addView(panel, lp(w, entries.size() * rowH + px(24), x, y));
+        int h = entries.size() * rowH + px(24);
+        if (centered) {
+            root.addView(panel, lp(w, h, (W - w) / 2, (H - h) / 2));
+        } else {
+            FrameLayout.LayoutParams pl = (FrameLayout.LayoutParams) pills[0].getLayoutParams();
+            int x = Math.min(pl.leftMargin, W - px(40) - w);
+            int y = pl.topMargin + pl.height + px(14);
+            page.addView(panel, lp(w, h, x, y));
+        }
         menuPanel = panel;
         menuIdx = 0;
         menuOpen = true;
@@ -541,7 +763,9 @@ public class MainActivity extends Activity {
     }
 
     void closeMenu() {
-        if (menuPanel != null) page.removeView(menuPanel);
+        if (menuPanel != null && menuPanel.getParent() != null) {
+            ((android.view.ViewGroup) menuPanel.getParent()).removeView(menuPanel);
+        }
         menuPanel = null;
         menuOpen = false;
     }
@@ -550,35 +774,70 @@ public class MainActivity extends Activity {
         if (k == KeyEvent.KEYCODE_DPAD_UP) { menuIdx = Math.max(0, menuIdx - 1); paintMenu(); }
         else if (k == KeyEvent.KEYCODE_DPAD_DOWN) { menuIdx = Math.min(entries.size() - 1, menuIdx + 1); paintMenu(); }
         else if (k == KeyEvent.KEYCODE_BACK) closeMenu();
-        else if (k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER
-                || k == KeyEvent.KEYCODE_NUMPAD_ENTER) {
-            Entry e = entries.get(menuIdx);
-            closeMenu();
-            if (e.intent == null) return;
-            try { startActivity(e.intent); }
-            catch (Throwable t) {
-                try { if (e.fallback != null) startActivity(e.fallback); else throw t; }
-                catch (Throwable t2) { Toast.makeText(this, "No se pudo cambiar de entrada", Toast.LENGTH_SHORT).show(); }
-            }
+    }
+
+    void menuSelect() {
+        Entry e = entries.get(menuIdx);
+        closeMenu();
+        if (e.action != null) { e.action.run(); return; }
+        if (e.intent == null) return;
+        try { startActivity(e.intent); }
+        catch (Throwable t) {
+            try { if (e.fallback != null) startActivity(e.fallback); else throw t; }
+            catch (Throwable t2) { Toast.makeText(this, "No se pudo cambiar de entrada", Toast.LENGTH_SHORT).show(); }
         }
     }
 
     // ---------- teclas ----------
     @Override public boolean dispatchKeyEvent(KeyEvent e) {
         int k = e.getKeyCode();
-        boolean nav = k == KeyEvent.KEYCODE_DPAD_UP || k == KeyEvent.KEYCODE_DPAD_DOWN
+        boolean center = k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER
+                || k == KeyEvent.KEYCODE_NUMPAD_ENTER;
+        boolean nav = center || k == KeyEvent.KEYCODE_DPAD_UP || k == KeyEvent.KEYCODE_DPAD_DOWN
                 || k == KeyEvent.KEYCODE_DPAD_LEFT || k == KeyEvent.KEYCODE_DPAD_RIGHT
-                || k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER
-                || k == KeyEvent.KEYCODE_NUMPAD_ENTER || k == KeyEvent.KEYCODE_BACK;
+                || k == KeyEvent.KEYCODE_BACK || k == KeyEvent.KEYCODE_MENU;
         if (!nav) return super.dispatchKeyEvent(e);
-        if (e.getAction() != KeyEvent.ACTION_DOWN) return true;
+        int act = e.getAction();
+        if (center) {
+            if (act == KeyEvent.ACTION_DOWN) {
+                if (e.getRepeatCount() == 0) {
+                    centerDown = true;
+                    longFired = false;
+                    if (!menuOpen && !moving && zone != TOP) handler.postDelayed(longPress, 600);
+                }
+            } else if (act == KeyEvent.ACTION_UP) {
+                handler.removeCallbacks(longPress);
+                boolean was = centerDown;
+                centerDown = false;
+                if (was && !longFired) {
+                    if (menuOpen) menuSelect();
+                    else if (moving) endMove();
+                    else activate();
+                }
+                longFired = false;
+            }
+            return true;
+        }
+        if (act != KeyEvent.ACTION_DOWN) return true;
+        if (k == KeyEvent.KEYCODE_MENU) {
+            if (moving) endMove();
+            else if (!menuOpen) openContextMenu();
+            return true;
+        }
         if (menuOpen) { menuKey(k); return true; }
+        if (moving) {
+            if (k == KeyEvent.KEYCODE_BACK) endMove();
+            else if (k == KeyEvent.KEYCODE_DPAD_UP) moveItem(0, -1);
+            else if (k == KeyEvent.KEYCODE_DPAD_DOWN) moveItem(0, 1);
+            else if (k == KeyEvent.KEYCODE_DPAD_LEFT) moveItem(-1, 0);
+            else if (k == KeyEvent.KEYCODE_DPAD_RIGHT) moveItem(1, 0);
+            return true;
+        }
         boolean first = e.getRepeatCount() == 0;
         if (k == KeyEvent.KEYCODE_DPAD_UP) { if (first) move(0, -1); }
         else if (k == KeyEvent.KEYCODE_DPAD_DOWN) { if (first) move(0, 1); }
         else if (k == KeyEvent.KEYCODE_DPAD_LEFT) move(-1, 0);
         else if (k == KeyEvent.KEYCODE_DPAD_RIGHT) move(1, 0);
-        else if (k != KeyEvent.KEYCODE_BACK) { if (first) activate(); }
         return true;
     }
 }
