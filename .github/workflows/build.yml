@@ -26,5 +26,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: Lanzador (ultima compilacion)
-          files: app/build/outputs/apk/debug/app-debug.apk
+          name: Lanzador y Control TV (ultima compilacion)
+          files: |
+            app/build/outputs/apk/debug/app-debug.apk
+            remote/build/outputs/apk/debug/remote-debug.apk
