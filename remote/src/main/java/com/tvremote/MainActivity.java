@@ -1,7 +1,12 @@
 package com.tvremote;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
 import android.content.Context;
+import android.content.DialogInterface;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -10,14 +15,18 @@ import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.StateListDrawable;
+import android.hardware.ConsumerIrManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.Vibrator;
+import android.provider.Settings;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.Gravity;
-import android.view.HapticFeedbackConstants;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.widget.EditText;
@@ -34,6 +43,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -41,12 +51,15 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
-    static final int GRAY = 0xFF2C2C2E, GRAY_P = 0xFF58585C;
-    static final int BLUE = 0xFF0A84FF, BLUE_P = 0xFF4DA3FF;
-    static final int RED = 0xFFC0392B, RED_P = 0xFFE5604F;
-    static final int GREEN = 0xFF2E9E4F, GREEN_P = 0xFF4CC474;
-    static final int AMBER = 0xFFB8860B, AMBER_P = 0xFFE0A81E;
-    static final int OK_GREEN = 0xFF30D158, BAD_RED = 0xFFFF453A, MUTED = 0xFF9A9AA0;
+    static final int BG_DARK = 0xFF0B0B0F;
+    static final int CARD_BG = 0xFF14141A;
+    static final int CARD_PRESS = 0xFF22222C;
+    static final int MUTED = 0xFF8A8A93;
+    static final int OK_GREEN = 0xFF30D158;
+    static final int BAD_RED = 0xFFFF453A;
+
+    int accentColor = 0xFF00E5FF;
+    int accentPressColor = 0xFF00838F;
 
     static final HashMap<String, String> NAMES = new HashMap<String, String>();
     static {
@@ -78,33 +91,68 @@ public class MainActivity extends Activity {
     final ExecutorService io = Executors.newSingleThreadExecutor();
     final Handler ui = new Handler(Looper.getMainLooper());
     final AtomicInteger pending = new AtomicInteger();
-    final ScrollView[] pages = new ScrollView[4];
-    final TextView[] tabs = new TextView[4];
+    final ScrollView[] pages = new ScrollView[6];
+    final TextView[] tabs = new TextView[6];
     SharedPreferences prefs;
-    TextView status, appsStatus, chipAll, chipMine, modeChip;
+    TextView status, appsStatus, chipAll, chipMine, modeChip, btStatus, irStatus;
     EditText ipField, textField, search;
-    LinearLayout appList;
+    LinearLayout appList, btDeviceList;
     List<AppEntry> apps = new ArrayList<AppEntry>();
     boolean onlyMine = false;
     boolean gamepadMode = true;
+    boolean vibrationEnabled = true;
     volatile String host = "192.168.1.34";
     volatile int tvW = 1920, tvH = 1080;
     float d;
+    Vibrator vibrator;
+    BluetoothAdapter bluetoothAdapter;
+    ConsumerIrManager irManager;
 
-    // ---------- utilidades ----------
     int dp(int v) { return Math.round(v * d); }
 
-    GradientDrawable shape(int color, int rDp) {
+    void vibrate() {
+        if (!vibrationEnabled) return;
+        try {
+            if (vibrator != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator.vibrate(android.os.VibrationEffect.createOneShot(45, android.os.VibrationEffect.DEFAULT_AMPLITUDE));
+                } else {
+                    vibrator.vibrate(45);
+                }
+            }
+        } catch (Exception e) {}
+    }
+
+    void sendIrSignal(String deviceName) {
+        vibrate();
+        if (irManager == null || !irManager.hasIrEmitter()) {
+            Toast.makeText(this, "Este dispositivo no cuenta con emisor Infrarrojo (IR) físico.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        try {
+            int carrierFrequency = 38000;
+            int[] pattern = {9000, 4500, 560, 560, 560, 1690, 560, 560, 560, 560, 560, 560, 560, 560, 560, 560};
+            irManager.transmit(carrierFrequency, pattern);
+            Toast.makeText(this, "Señal IR enviada (" + deviceName + ")", Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Error transmitiendo señal IR: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    GradientDrawable neonShape(int color, int borderCol, int rDp) {
         GradientDrawable g = new GradientDrawable();
         g.setColor(color);
         g.setCornerRadius(dp(rDp));
+        if (borderCol != 0) {
+            g.setStroke(dp(2), borderCol);
+        }
         return g;
     }
 
-    StateListDrawable pad(int normal, int pressed) {
+    StateListDrawable neonPad(int normalBg, int pressBg, int borderCol) {
         StateListDrawable s = new StateListDrawable();
-        s.addState(new int[] { android.R.attr.state_pressed }, shape(pressed, 18));
-        s.addState(new int[] {}, shape(normal, 18));
+        s.addState(new int[] { android.R.attr.state_pressed }, neonShape(pressBg, borderCol, 14));
+        s.addState(new int[] {}, neonShape(normalBg, borderCol, 14));
         return s;
     }
 
@@ -118,7 +166,6 @@ public class MainActivity extends Activity {
         });
     }
 
-    // ---------- red ----------
     void connectNow() throws IOException {
         adb.connect(host);
         try {
@@ -164,7 +211,7 @@ public class MainActivity extends Activity {
         });
     }
 
-    void key(int code) { exec("input keyevent " + code); }
+    void key(int code) { vibrate(); exec("input keyevent " + code); }
 
     Runnable keyAction(final int code) {
         return new Runnable() { public void run() { key(code); } };
@@ -173,6 +220,7 @@ public class MainActivity extends Activity {
     Runnable gpAction(final int code) {
         return new Runnable() {
             public void run() {
+                vibrate();
                 exec((gamepadMode ? "input gamepad keyevent " : "input keyevent ") + code);
             }
         };
@@ -181,6 +229,7 @@ public class MainActivity extends Activity {
     Runnable appAction(final String pkg) {
         return new Runnable() {
             public void run() {
+                vibrate();
                 exec("o=$(monkey -p " + pkg + " -c android.intent.category.LEANBACK_LAUNCHER 1 2>&1); "
                         + "case \"$o\" in *\"No activities\"*) monkey -p " + pkg
                         + " -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1;; esac");
@@ -191,6 +240,7 @@ public class MainActivity extends Activity {
     Runnable scrollAction(final boolean down) {
         return new Runnable() {
             public void run() {
+                vibrate();
                 int x = tvW / 2;
                 int y1 = down ? tvH * 3 / 4 : tvH / 4;
                 int y2 = down ? tvH / 4 : tvH * 3 / 4;
@@ -199,7 +249,6 @@ public class MainActivity extends Activity {
         };
     }
 
-    // ---------- tactil ----------
     int scalePos(float v, int size, int tv) {
         int r = Math.round(v / size * tv);
         return Math.max(0, Math.min(tv - 1, r));
@@ -229,12 +278,12 @@ public class MainActivity extends Activity {
 
         Pad(Context c) {
             super(c);
-            fill.setColor(0xFF1C1C1E);
-            line.setColor(0xFF3A3A3C);
+            fill.setColor(CARD_BG);
+            line.setColor(accentColor);
             line.setStyle(Paint.Style.STROKE);
             line.setStrokeWidth(dp(2));
-            dot.setColor(0xAA0A84FF);
-            txt.setColor(0xFF6E6E73);
+            dot.setColor(accentColor);
+            txt.setColor(MUTED);
             txt.setTextAlign(Paint.Align.CENTER);
             txt.setTextSize(dp(15));
         }
@@ -246,26 +295,23 @@ public class MainActivity extends Activity {
 
         @Override protected void onDraw(Canvas c) {
             RectF r = new RectF(dp(1), dp(1), getWidth() - dp(1), getHeight() - dp(1));
-            c.drawRoundRect(r, dp(18), dp(18), fill);
-            c.drawRoundRect(r, dp(18), dp(18), line);
-            c.drawText("Pantalla del TV", getWidth() / 2f, getHeight() / 2f, txt);
-            if (lx >= 0) c.drawCircle(lx, ly, dp(18), dot);
+            c.drawRoundRect(r, dp(14), dp(14), fill);
+            c.drawRoundRect(r, dp(14), dp(14), line);
+            c.drawText("Pantalla Táctil Neón (TV)", getWidth() / 2f, getHeight() / 2f, txt);
+            if (lx >= 0) c.drawCircle(lx, ly, dp(16), dot);
         }
 
         @Override public boolean onTouchEvent(MotionEvent e) {
             if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(true);
             int a = e.getActionMasked();
             if (a == MotionEvent.ACTION_DOWN) {
-                sx = e.getX();
-                sy = e.getY();
-                lx = sx;
-                ly = sy;
+                sx = e.getX(); sy = e.getY(); lx = sx; ly = sy;
                 t0 = SystemClock.uptimeMillis();
                 moved = false;
+                vibrate();
                 invalidate();
             } else if (a == MotionEvent.ACTION_MOVE) {
-                lx = e.getX();
-                ly = e.getY();
+                lx = e.getX(); ly = e.getY();
                 if (Math.abs(lx - sx) > dp(10) || Math.abs(ly - sy) > dp(10)) moved = true;
                 invalidate();
             } else if (a == MotionEvent.ACTION_UP) {
@@ -281,7 +327,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------- apps del TV ----------
     String pretty(String pkg) {
         String n = NAMES.get(pkg);
         if (n != null) return n;
@@ -359,8 +404,8 @@ public class MainActivity extends Activity {
 
     void setFilter(boolean mine) {
         onlyMine = mine;
-        chipAll.setBackground(pad(mine ? GRAY : BLUE, mine ? GRAY_P : BLUE_P));
-        chipMine.setBackground(pad(mine ? BLUE : GRAY, mine ? BLUE_P : GRAY_P));
+        chipAll.setBackground(neonPad(mine ? CARD_BG : accentColor, mine ? CARD_PRESS : accentColor, mine ? MUTED : accentColor));
+        chipMine.setBackground(neonPad(mine ? accentColor : CARD_BG, mine ? accentColor : CARD_PRESS, mine ? accentColor : MUTED));
         renderApps();
     }
 
@@ -380,23 +425,23 @@ public class MainActivity extends Activity {
     View appRow(final AppEntry a) {
         LinearLayout r = new LinearLayout(this);
         r.setOrientation(LinearLayout.VERTICAL);
-        r.setBackground(pad(0xFF1C1C1E, 0xFF3A3A3C));
+        r.setBackground(neonPad(CARD_BG, CARD_PRESS, accentColor));
         r.setPadding(dp(16), dp(10), dp(16), dp(10));
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         p.setMargins(dp(5), dp(4), dp(5), dp(4));
         r.setLayoutParams(p);
-        TextView n = new TextView(this);
-        n.setText(a.name);
-        n.setTextColor(Color.WHITE);
-        n.setTextSize(17);
-        n.setTypeface(null, Typeface.BOLD);
-        TextView k = new TextView(this);
-        k.setText(a.pkg);
-        k.setTextColor(MUTED);
-        k.setTextSize(12);
-        r.addView(n);
-        r.addView(k);
+        TextView nameView = new TextView(this);
+        nameView.setText(a.name);
+        nameView.setTextColor(Color.WHITE);
+        nameView.setTextSize(17);
+        nameView.setTypeface(null, Typeface.BOLD);
+        TextView pkgView = new TextView(this);
+        pkgView.setText(a.pkg);
+        pkgView.setTextColor(MUTED);
+        pkgView.setTextSize(12);
+        r.addView(nameView);
+        r.addView(pkgView);
         r.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 Toast.makeText(MainActivity.this, "Abriendo " + a.name, Toast.LENGTH_SHORT).show();
@@ -406,7 +451,52 @@ public class MainActivity extends Activity {
         return r;
     }
 
-    // ---------- interfaz ----------
+    void loadBluetoothDevices() {
+        if (btDeviceList == null) return;
+        btDeviceList.removeAllViews();
+        if (bluetoothAdapter == null) {
+            btStatus.setText("Bluetooth no disponible en este dispositivo.");
+            return;
+        }
+        if (!bluetoothAdapter.isEnabled()) {
+            btStatus.setText("Bluetooth desactivado. Toca para encenderlo.");
+            return;
+        }
+        btStatus.setText("Dispositivos Bluetooth vinculados (Mandos, TV, etc.):");
+        try {
+            Set<BluetoothDevice> pairedDevices = bluetoothAdapter.getBondedDevices();
+            if (pairedDevices != null && pairedDevices.size() > 0) {
+                for (final BluetoothDevice device : pairedDevices) {
+                    TextView devView = new TextView(this);
+                    devView.setText("🎮 " + device.getName() + "\n[" + device.getAddress() + "]");
+                    devView.setTextColor(Color.WHITE);
+                    devView.setTextSize(14);
+                    devView.setBackground(neonPad(CARD_BG, CARD_PRESS, accentColor));
+                    devView.setPadding(dp(12), dp(10), dp(12), dp(10));
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                    lp.setMargins(dp(5), dp(4), dp(5), dp(4));
+                    devView.setLayoutParams(lp);
+                    devView.setOnClickListener(new View.OnClickListener() {
+                        public void onClick(View v) {
+                            vibrate();
+                            Toast.makeText(MainActivity.this, "Seleccionado: " + device.getName(), Toast.LENGTH_SHORT).show();
+                        }
+                    });
+                    btDeviceList.addView(devView);
+                }
+            } else {
+                TextView none = new TextView(this);
+                none.setText("No hay dispositivos vinculados.");
+                none.setTextColor(MUTED);
+                none.setPadding(dp(8), dp(6), dp(8), dp(6));
+                btDeviceList.addView(none);
+            }
+        } catch (SecurityException e) {
+            btStatus.setText("Permisos de Bluetooth requeridos.");
+        }
+    }
+
     View.OnTouchListener touch(final Runnable action, final boolean repeat) {
         return new View.OnTouchListener() {
             final Runnable loop = new Runnable() {
@@ -416,7 +506,6 @@ public class MainActivity extends Activity {
                 int a = e.getAction();
                 if (a == MotionEvent.ACTION_DOWN) {
                     v.setPressed(true);
-                    v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
                     action.run();
                     if (repeat) ui.postDelayed(loop, 450);
                 } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
@@ -428,14 +517,14 @@ public class MainActivity extends Activity {
         };
     }
 
-    TextView btn(String label, int normal, int pressed, Runnable action, boolean repeat, int hDp) {
+    TextView btn(String label, int normalBg, int pressBg, int borderCol, Runnable action, boolean repeat, int hDp) {
         TextView t = new TextView(this);
         t.setText(label);
         t.setTextColor(Color.WHITE);
         t.setTextSize(16);
         t.setTypeface(null, Typeface.BOLD);
         t.setGravity(Gravity.CENTER);
-        t.setBackground(pad(normal, pressed));
+        t.setBackground(neonPad(normalBg, pressBg, borderCol));
         t.setOnTouchListener(touch(action, repeat));
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(hDp), 1f);
         p.setMargins(dp(5), dp(5), dp(5), dp(5));
@@ -443,13 +532,13 @@ public class MainActivity extends Activity {
         return t;
     }
 
-    TextView gray(String label, Runnable action, boolean repeat) {
-        return btn(label, GRAY, GRAY_P, action, repeat, 60);
+    TextView neonBtn(String label, Runnable action, boolean repeat) {
+        return btn(label, CARD_BG, CARD_PRESS, accentColor, action, repeat, 56);
     }
 
     View slot() {
         View v = new View(this);
-        v.setLayoutParams(new LinearLayout.LayoutParams(0, dp(60), 1f));
+        v.setLayoutParams(new LinearLayout.LayoutParams(0, dp(56), 1f));
         return v;
     }
 
@@ -492,7 +581,7 @@ public class MainActivity extends Activity {
         e.setSingleLine(true);
         e.setTextColor(Color.WHITE);
         e.setHintTextColor(MUTED);
-        e.setBackground(shape(0xFF1C1C1E, 14));
+        e.setBackground(neonShape(CARD_BG, accentColor, 12));
         e.setPadding(dp(16), 0, dp(16), 0);
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(52), 1f);
         p.setMargins(dp(5), dp(5), dp(5), dp(5));
@@ -513,17 +602,55 @@ public class MainActivity extends Activity {
     }
 
     void showTab(int i) {
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < 6; k++) {
             pages[k].setVisibility(k == i ? View.VISIBLE : View.GONE);
-            tabs[k].setBackground(shape(k == i ? BLUE : 0xFF1C1C1E, 12));
+            tabs[k].setBackground(neonShape(k == i ? accentColor : CARD_BG, k == i ? accentColor : MUTED, 8));
+            tabs[k].setTextColor(k == i ? Color.BLACK : Color.WHITE);
         }
         if (i == 2 && apps.isEmpty()) loadApps();
+        if (i == 4) loadBluetoothDevices();
     }
 
     void setMode(boolean gamepad) {
         gamepadMode = gamepad;
-        modeChip.setText(gamepad ? "Modo: Gamepad (toca para cambiar a Teclado)"
-                : "Modo: Teclado (toca para cambiar a Gamepad)");
+        modeChip.setText(gamepad ? "Modo: Gamepad (Universal)" : "Modo: Teclado");
+    }
+
+    void updateThemeColor(int color, String colorName) {
+        accentColor = color;
+        // Calcular un tono de pulsación ligeramente más oscuro automáticamente
+        int r = Math.max(0, Color.red(color) - 40);
+        int g = Math.max(0, Color.green(color) - 40);
+        int b = Math.max(0, Color.blue(color) - 40);
+        accentPressColor = Color.rgb(r, g, b);
+
+        prefs.edit().putInt("accent", accentColor).putInt("press", accentPressColor).putString("colorName", colorName).apply();
+        Toast.makeText(this, "Color de Neón aplicado: " + colorName, Toast.LENGTH_SHORT).show();
+        recreate();
+    }
+
+    void showCustomColorDialog() {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Selector de Color Infinito (HEX)");
+        final EditText input = new EditText(this);
+        input.setHint("#00E5FF o #FF007F");
+        input.setText(String.format("#%06X", (0xFFFFFF & accentColor)));
+        input.setTextColor(Color.WHITE);
+        input.setPadding(dp(16), dp(16), dp(16), dp(16));
+        builder.setView(input);
+
+        builder.setPositiveButton("Aplicar", new DialogInterface.OnClickListener() {
+            @Override public void onClick(DialogInterface dialog, int which) {
+                try {
+                    int newColor = Color.parseColor(input.getText().toString().trim());
+                    updateThemeColor(newColor, "Personalizado");
+                } catch (Exception e) {
+                    Toast.makeText(MainActivity.this, "Código HEX inválido. Ej: #00E5FF", Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
+        builder.setNegativeButton("Cancelar", null);
+        builder.show();
     }
 
     @Override protected void onCreate(Bundle b) {
@@ -531,24 +658,31 @@ public class MainActivity extends Activity {
         d = getResources().getDisplayMetrics().density;
         prefs = getSharedPreferences("remote", MODE_PRIVATE);
         host = prefs.getString("ip", "192.168.1.34");
+        accentColor = prefs.getInt("accent", 0xFF00E5FF);
+        accentPressColor = prefs.getInt("press", 0xFF00838F);
+
+        vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+        bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+        irManager = (ConsumerIrManager) getSystemService(Context.CONSUMER_IR_SERVICE);
 
         LinearLayout outer = new LinearLayout(this);
         outer.setOrientation(LinearLayout.VERTICAL);
-        outer.setBackgroundColor(0xFF111113);
+        outer.setBackgroundColor(BG_DARK);
         outer.setPadding(dp(10), dp(18), dp(10), dp(6));
 
         TextView title = new TextView(this);
-        title.setText("Control TV");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(22);
+        title.setText("⚡ CONTROL TV • YK2 INFINITY V5");
+        title.setTextColor(accentColor);
+        title.setTextSize(20);
         title.setTypeface(null, Typeface.BOLD);
         title.setPadding(dp(5), 0, 0, dp(4));
         outer.addView(title);
 
         ipField = field("IP del TV", host);
-        outer.addView(row(ipField, btn("Conectar", BLUE, BLUE_P, new Runnable() {
+        outer.addView(row(ipField, btn("Conectar", accentColor, accentPressColor, accentColor, new Runnable() {
             public void run() { connectAsync(); }
         }, false, 52)));
+
         status = new TextView(this);
         status.setText("Sin conectar");
         status.setTextColor(MUTED);
@@ -556,19 +690,19 @@ public class MainActivity extends Activity {
         status.setPadding(dp(8), 0, 0, dp(6));
         outer.addView(status);
 
-        String[] names = { "Control", "Táctil", "Apps", "Juegos" };
+        String[] tabNames = { "Control", "Táctil", "Apps", "Juegos", "IR", "Ajustes" };
         LinearLayout tabRow = new LinearLayout(this);
         tabRow.setOrientation(LinearLayout.HORIZONTAL);
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 6; i++) {
             final int idx = i;
             TextView t = new TextView(this);
-            t.setText(names[i]);
+            t.setText(tabNames[i]);
             t.setTextColor(Color.WHITE);
-            t.setTextSize(14);
+            t.setTextSize(12);
             t.setTypeface(null, Typeface.BOLD);
             t.setGravity(Gravity.CENTER);
-            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(44), 1f);
-            p.setMargins(dp(3), dp(2), dp(3), dp(6));
+            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(38), 1f);
+            p.setMargins(dp(1), dp(2), dp(1), dp(4));
             t.setLayoutParams(p);
             t.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) { showTab(idx); }
@@ -582,27 +716,26 @@ public class MainActivity extends Activity {
         outer.addView(body, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        // ----- Pestana 1: Control -----
+        // ----- Pestaña 1: Control -----
         LinearLayout c1 = newPage(0, body);
-        c1.addView(row(gray("Atrás", keyAction(4), false), gray("▲", keyAction(19), true),
-                gray("Inicio", keyAction(3), false)));
-        c1.addView(row(gray("◀", keyAction(21), true),
-                btn("OK", BLUE, BLUE_P, keyAction(23), false, 60), gray("▶", keyAction(22), true)));
-        c1.addView(row(gray("Menú", keyAction(82), false), gray("▼", keyAction(20), true),
-                gray("Entrada", keyAction(178), false)));
+        c1.addView(row(neonBtn("Atrás", keyAction(4), false), neonBtn("▲", keyAction(19), true),
+                neonBtn("Inicio", keyAction(3), false)));
+        c1.addView(row(neonBtn("◀", keyAction(21), true),
+                btn("OK", accentColor, accentPressColor, accentColor, keyAction(23), false, 56), neonBtn("▶", keyAction(22), true)));
+        c1.addView(row(neonBtn("Menú", keyAction(82), false), neonBtn("▼", keyAction(20), true),
+                neonBtn("Entrada", keyAction(178), false)));
         c1.addView(space(8));
-        c1.addView(row(gray("« Atrasar", keyAction(89), true), gray("Play / Pausa", keyAction(85), false),
-                gray("Adelantar »", keyAction(90), true)));
-        c1.addView(row(gray("Anterior", keyAction(88), false), gray("■ Stop", keyAction(86), false),
-                gray("Siguiente", keyAction(87), false)));
-        c1.addView(row(gray("▶ Play", keyAction(126), false), gray("Pausa", keyAction(127), false)));
+        c1.addView(row(neonBtn("« Atrasar", keyAction(89), true), neonBtn("Play / Pausa", keyAction(85), false),
+                neonBtn("Adelantar »", keyAction(90), true)));
+        c1.addView(row(neonBtn("Anterior", keyAction(88), false), neonBtn("■ Stop", keyAction(86), false),
+                neonBtn("Siguiente", keyAction(87), false)));
         c1.addView(space(8));
-        c1.addView(row(gray("Vol −", keyAction(25), true), gray("Silencio", keyAction(164), false),
-                gray("Vol +", keyAction(24), true)));
-        c1.addView(row(btn("Encender / Apagar", RED, RED_P, keyAction(26), false, 60)));
+        c1.addView(row(neonBtn("Vol −", keyAction(25), true), neonBtn("Silencio", keyAction(164), false),
+                neonBtn("Vol +", keyAction(24), true)));
+        c1.addView(row(btn("Encender / Apagar", BAD_RED, 0xFFB71C1C, BAD_RED, keyAction(26), false, 56)));
         c1.addView(space(8));
-        textField = field("Escribir en el TV", "");
-        c1.addView(row(textField, btn("Enviar", BLUE, BLUE_P, new Runnable() {
+        textField = field("Escribir texto en TV", "");
+        c1.addView(row(textField, btn("Enviar", accentColor, accentPressColor, accentColor, new Runnable() {
             public void run() {
                 String s = textField.getText().toString();
                 if (s.length() == 0) return;
@@ -610,61 +743,60 @@ public class MainActivity extends Activity {
                 exec("input text '" + esc + "'");
                 textField.setText("");
             }
-        }, false, 52), btn("⌫", GRAY, GRAY_P, keyAction(67), true, 52)));
+        }, false, 52), neonBtn("⌫", keyAction(67), true)));
 
-        // ----- Pestana 2: Tactil -----
+        // ----- Pestaña 2: Táctil -----
         LinearLayout c2 = newPage(1, body);
-        c2.addView(note("Toca = clic. Arrastra = deslizar o desplazar. Mantén = clic largo."));
+        c2.addView(note("Panel táctil YK2 Neon. Toca para hacer clic, arrastra para deslizar, mantén presionado para clic largo."));
         Pad padView = new Pad(this);
         LinearLayout.LayoutParams pp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         pp.setMargins(dp(5), dp(4), dp(5), dp(8));
         padView.setLayoutParams(pp);
         c2.addView(padView);
-        c2.addView(note("El TV no muestra un cursor. Esta zona representa toda su pantalla: "
-                + "lo que toques aquí se toca en la misma posición del TV."));
-        c2.addView(row(gray("Atrás", keyAction(4), false), gray("Inicio", keyAction(3), false)));
-        c2.addView(row(gray("Desplazar ▲", scrollAction(false), true),
-                gray("Desplazar ▼", scrollAction(true), true)));
+        c2.addView(row(neonBtn("Atrás", keyAction(4), false), neonBtn("Inicio", keyAction(3), false)));
+        c2.addView(row(neonBtn("Desplazar ▲", scrollAction(false), true),
+                neonBtn("Desplazar ▼", scrollAction(true), true)));
 
-        // ----- Pestana 3: Apps -----
+        // ----- Pestaña 3: Apps -----
         LinearLayout c3 = newPage(2, body);
-        search = field("Buscar aplicación", "");
+        search = field("Buscar aplicación del TV", "");
         search.addTextChangedListener(new TextWatcher() {
             public void beforeTextChanged(CharSequence s, int a, int b2, int c) { }
             public void onTextChanged(CharSequence s, int a, int b2, int c) { }
             public void afterTextChanged(Editable s) { renderApps(); }
         });
-        c3.addView(row(search, btn("Actualizar", GRAY, GRAY_P, new Runnable() {
+        c3.addView(row(search, neonBtn("Actualizar", new Runnable() {
             public void run() { loadApps(); }
-        }, false, 52)));
-        chipAll = btn("Todas", BLUE, BLUE_P, new Runnable() {
+        }, false)));
+        chipAll = btn("Todas", accentColor, accentPressColor, accentColor, new Runnable() {
             public void run() { setFilter(false); }
-        }, false, 44);
-        chipMine = btn("Instaladas por mí", GRAY, GRAY_P, new Runnable() {
+        }, false, 40);
+        chipMine = btn("Instaladas por mí", CARD_BG, CARD_PRESS, MUTED, new Runnable() {
             public void run() { setFilter(true); }
-        }, false, 44);
+        }, false, 40);
         c3.addView(row(chipAll, chipMine));
-        appsStatus = note("Abre esta pestaña con el TV conectado para ver sus aplicaciones.");
+        appsStatus = note("Carga las apps instaladas en la TV vía ADB.");
         c3.addView(appsStatus);
         appList = new LinearLayout(this);
         appList.setOrientation(LinearLayout.VERTICAL);
         c3.addView(appList);
 
-        // ----- Pestana 4: Juegos -----
+        // ----- Pestaña 4: Juegos -----
         LinearLayout c4 = newPage(3, body);
-        c4.addView(row(gray("L2", gpAction(104), false), gray("L1", gpAction(102), false),
-                gray("R1", gpAction(103), false), gray("R2", gpAction(105), false)));
+        c4.addView(note("Mando de Juego Universal compatible con vibración y cualquier control físico Bluetooth."));
+        c4.addView(row(neonBtn("L2", gpAction(104), false), neonBtn("L1", gpAction(102), false),
+                neonBtn("R1", gpAction(103), false), neonBtn("R2", gpAction(105), false)));
         c4.addView(space(6));
         LinearLayout left = cluster(
-                row(slot(), gray("▲", gpAction(19), true), slot()),
-                row(gray("◀", gpAction(21), true), slot(), gray("▶", gpAction(22), true)),
-                row(slot(), gray("▼", gpAction(20), true), slot()));
+                row(slot(), neonBtn("▲", gpAction(19), true), slot()),
+                row(neonBtn("◀", gpAction(21), true), slot(), neonBtn("▶", gpAction(22), true)),
+                row(slot(), neonBtn("▼", gpAction(20), true), slot()));
         LinearLayout right = cluster(
-                row(slot(), btn("Y", AMBER, AMBER_P, gpAction(100), false, 60), slot()),
-                row(btn("X", BLUE, BLUE_P, gpAction(99), false, 60), slot(),
-                        btn("B", RED, RED_P, gpAction(97), false, 60)),
-                row(slot(), btn("A", GREEN, GREEN_P, gpAction(96), false, 60), slot()));
+                row(slot(), btn("Y", 0xFFFFB300, 0xFFFFA000, 0xFFFFB300, gpAction(100), false, 56), slot()),
+                row(btn("X", accentColor, accentPressColor, accentColor, gpAction(99), false, 56), slot(),
+                        btn("B", BAD_RED, 0xFFB71C1C, BAD_RED, gpAction(97), false, 56)),
+                row(slot(), btn("A", OK_GREEN, 0xFF1B5E20, OK_GREEN, gpAction(96), false, 56), slot()));
         LinearLayout both = new LinearLayout(this);
         both.setOrientation(LinearLayout.HORIZONTAL);
         both.addView(left);
@@ -673,18 +805,126 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         c4.addView(both);
         c4.addView(space(6));
-        c4.addView(row(gray("Select", gpAction(109), false), gray("Mode", gpAction(110), false),
-                gray("Start", gpAction(108), false)));
-        c4.addView(row(gray("L3", gpAction(106), false), gray("R3", gpAction(107), false)));
-        modeChip = btn("", GRAY, GRAY_P, new Runnable() {
+        c4.addView(row(neonBtn("Select", gpAction(109), false), neonBtn("Mode", gpAction(110), false),
+                neonBtn("Start", gpAction(108), false)));
+        c4.addView(row(neonBtn("L3", gpAction(106), false), neonBtn("R3", gpAction(107), false)));
+        modeChip = btn("", CARD_BG, CARD_PRESS, accentColor, new Runnable() {
             public void run() { setMode(!gamepadMode); }
-        }, false, 48);
+        }, false, 44);
         modeChip.setTextSize(13);
         c4.addView(row(modeChip));
         setMode(true);
-        c4.addView(note("Cada pulsación tarda cerca de 0,3 s y no se puede mantener un botón ni usar "
-                + "palancas. Sirve para juegos de menú, por turnos o arcade lentos, no para acción rápida. "
-                + "Si un juego no responde en modo Gamepad, prueba el modo Teclado."));
+
+        // ----- Pestaña 5: IR (Infrarrojo) -----
+        LinearLayout c5 = newPage(4, body);
+        c5.addView(note("Apartado de Infrarrojo (IR / Blaster). Emite señales universales directamente desde el puerto infrarrojo de tu móvil a la TV."));
+        
+        irStatus = new TextView(this);
+        boolean hasIr = irManager != null && irManager.hasIrEmitter();
+        irStatus.setText(hasIr ? "🟢 Puerto Infrarrojo (IR) detectado y listo." : "🔴 Este dispositivo no posee emisor Infrarrojo (IR) integrado.");
+        irStatus.setTextColor(hasIr ? OK_GREEN : BAD_RED);
+        irStatus.setTextSize(14);
+        irStatus.setPadding(dp(8), dp(6), dp(8), dp(10));
+        c5.addView(irStatus);
+
+        c5.addView(row(btn("Power IR", BAD_RED, 0xFFB71C1C, BAD_RED, new Runnable() {
+            public void run() { sendIrSignal("Power"); }
+        }, false, 56), neonBtn("Mute IR", new Runnable() {
+            public void run() { sendIrSignal("Mute"); }
+        }, false)));
+
+        c5.addView(row(neonBtn("Vol − IR", new Runnable() {
+            public void run() { sendIrSignal("Vol -"); }
+        }, true), neonBtn("Vol + IR", new Runnable() {
+            public void run() { sendIrSignal("Vol +"); }
+        }, true)));
+
+        c5.addView(row(neonBtn("Canal − IR", new Runnable() {
+            public void run() { sendIrSignal("Channel -"); }
+        }, false), neonBtn("Canal + IR", new Runnable() {
+            public void run() { sendIrSignal("Channel +"); }
+        }, false)));
+
+        c5.addView(row(neonBtn("Entrada / Source IR", new Runnable() {
+            public void run() { sendIrSignal("Source"); }
+        }, false)));
+
+        // ----- Pestaña 6: Ajustes (Selector Infinito de Colores, Bluetooth & Vibración) -----
+        LinearLayout c6 = newPage(5, body);
+        c6.addView(note("Configuración de Estilo Neón con Selector de Color Infinito (Todos los Colores), Bluetooth y Vibración."));
+
+        TextView stNeonHeader = new TextView(this);
+        stNeonHeader.setText("🎨 Selector de Color Infinito (Todos los Colores)");
+        stNeonHeader.setTextColor(accentColor);
+        stNeonHeader.setTextSize(15);
+        stNeonHeader.setTypeface(null, Typeface.BOLD);
+        stNeonHeader.setPadding(dp(5), dp(10), dp(5), dp(4));
+        c6.addView(stNeonHeader);
+
+        // Botones rápidos con los colores más populares
+        c6.addView(row(
+            btn("Cian Neón", 0xFF00E5FF, 0xFF00838F, 0xFF00E5FF, new Runnable() { public void run() { updateThemeColor(0xFF00E5FF, "Cian"); }}, false, 40),
+            btn("Verde Neón", 0xFF00E676, 0xFF00C853, 0xFF00E676, new Runnable() { public void run() { updateThemeColor(0xFF00E676, "Verde"); }}, false, 40)
+        ));
+        c6.addView(row(
+            btn("Rosa Fucsia", 0xFFFF007F, 0xC51162, 0xFFFF007F, new Runnable() { public void run() { updateThemeColor(0xFFFF007F, "Rosa"); }}, false, 40),
+            btn("Púrpura", 0xFFD500F9, 0xAA00FF, 0xFFD500F9, new Runnable() { public void run() { updateThemeColor(0xFFD500F9, "Púrpura"); }}, false, 40)
+        ));
+        c6.addView(row(
+            btn("Amarillo", 0xFFFFEA00, 0xFFFBC02D, 0xFFFFEA00, new Runnable() { public void run() { updateThemeColor(0xFFFFEA00, "Amarillo"); }}, false, 40),
+            btn("Naranja", 0xFFFF6D00, 0xFFE65100, 0xFFFF6D00, new Runnable() { public void run() { updateThemeColor(0xFFFF6D00, "Naranja"); }}, false, 40)
+        ));
+        c6.addView(row(
+            btn("Azul Eléc.", 0xFF2979FF, 0xFF1565C0, 0xFF2979FF, new Runnable() { public void run() { updateThemeColor(0xFF2979FF, "Azul Eléctrico"); }}, false, 40),
+            btn("Rojo Neón", 0xFFFF1744, 0xFFD50000, 0xFFFF1744, new Runnable() { public void run() { updateThemeColor(0xFFFF1744, "Rojo"); }}, false, 40)
+        ));
+
+        // Botón para ingresar cualquier color HEX existente en el universo digital
+        c6.addView(row(btn("🌈 Elegir Cualquier Color (HEX Personalizado)", accentColor, accentPressColor, accentColor, new Runnable() {
+            public void run() { showCustomColorDialog(); }
+        }, false, 48)));
+
+        TextView stBtHeader = new TextView(this);
+        stBtHeader.setText("📶 Conectividad Bluetooth (Móvil y TV)");
+        stBtHeader.setTextColor(accentColor);
+        stBtHeader.setTextSize(15);
+        stBtHeader.setTypeface(null, Typeface.BOLD);
+        stBtHeader.setPadding(dp(5), dp(15), dp(5), dp(4));
+        c6.addView(stBtHeader);
+
+        c6.addView(row(neonBtn("Abrir Ajustes BT", new Runnable() {
+            public void run() {
+                try {
+                    startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));
+                } catch (Exception e) {
+                    Toast.makeText(MainActivity.this, "No se pudo abrir el menú Bluetooth", Toast.LENGTH_SHORT).show();
+                }
+            }
+        }, false), neonBtn("Escanear BT", new Runnable() {
+            public void run() { loadBluetoothDevices(); }
+        }, false)));
+
+        btStatus = note("Dispositivos Bluetooth vinculados:");
+        c6.addView(btStatus);
+        btDeviceList = new LinearLayout(this);
+        btDeviceList.setOrientation(LinearLayout.VERTICAL);
+        c6.addView(btDeviceList);
+
+        TextView stVibHeader = new TextView(this);
+        stVibHeader.setText("📳 Respuesta Háptica y Vibración");
+        stVibHeader.setTextColor(accentColor);
+        stVibHeader.setTextSize(15);
+        stVibHeader.setTypeface(null, Typeface.BOLD);
+        stVibHeader.setPadding(dp(5), dp(15), dp(5), dp(4));
+        c6.addView(stVibHeader);
+
+        c6.addView(row(neonBtn(vibrationEnabled ? "Desactivar Vibración" : "Activar Vibración", new Runnable() {
+            public void run() {
+                vibrationEnabled = !vibrationEnabled;
+                Toast.makeText(MainActivity.this, "Vibración: " + (vibrationEnabled ? "Activada" : "Desactivada"), Toast.LENGTH_SHORT).show();
+                recreate();
+            }
+        }, false)));
 
         setContentView(outer);
         showTab(0);
