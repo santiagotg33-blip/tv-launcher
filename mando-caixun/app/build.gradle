@@ -42,11 +42,17 @@ android {
 
     packaging {
         resources {
-            excludes += ['META-INF/AL2.0', 'META-INF/LGPL2.1', 'META-INF/versions/**']
+            excludes += ['META-INF/LICENSE*', 'META-INF/NOTICE*', 'META-INF/DEPENDENCIES',
+                    'META-INF/INDEX.LIST', 'META-INF/AL2.0', 'META-INF/LGPL2.1',
+                    'META-INF/versions/**']
         }
     }
 }
 
 dependencies {
-    implementation 'dev.mobile:dadb:1.2.7'
+    implementation('dev.mobile:dadb:1.2.7') {
+        exclude group: 'org.junit.jupiter'
+        exclude group: 'org.junit.platform'
+        exclude group: 'org.junit'
+    }
 }
