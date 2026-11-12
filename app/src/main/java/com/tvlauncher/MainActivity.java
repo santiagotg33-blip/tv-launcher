@@ -15,11 +15,16 @@ import android.graphics.Outline;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.media.MediaMetadata;
+import android.media.session.MediaController;
+import android.media.session.MediaSessionManager;
+import android.media.session.PlaybackState;
 import android.media.tv.TvContract;
 import android.media.tv.TvInputInfo;
 import android.media.tv.TvInputManager;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
+import android.net.Uri;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
@@ -34,6 +39,7 @@ import android.view.View;
 import android.view.ViewOutlineProvider;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 import java.text.SimpleDateFormat;
@@ -78,9 +84,18 @@ public class MainActivity extends Activity {
     SharedPreferences prefs;
     BroadcastReceiver pkgReceiver;
 
+    // Media & Visualizer Widget
+    MediaSessionManager mediaManager;
+    MediaController activeController;
+    FrameLayout mediaWidget;
+    ImageView albumArt;
+    TextView trackTitle, trackArtist;
+    LinearLayout waveContainer;
+    final List<View> waveBars = new ArrayList<View>();
+
     final Runnable rebuild = new Runnable() { public void run() { buildUi(); } };
     final Runnable tick = new Runnable() {
-        public void run() { updateClock(); handler.postDelayed(this, 15000); }
+        public void run() { updateClock(); updateMediaState(); handler.postDelayed(this, 1500); }
     };
     final Runnable longPress = new Runnable() {
         public void run() {
@@ -96,6 +111,9 @@ public class MainActivity extends Activity {
         dockIdx = prefs.getInt("dock", 0);
         gridIdx = prefs.getInt("grid", 0);
         face = loadFace();
+        try {
+            mediaManager = (MediaSessionManager) getSystemService(Context.MEDIA_SESSION_SERVICE);
+        } catch (Throwable t) {}
         buildUi();
         pkgReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context c, Intent i) {
@@ -111,7 +129,11 @@ public class MainActivity extends Activity {
         registerReceiver(pkgReceiver, f);
     }
 
-    @Override protected void onResume() { super.onResume(); handler.post(tick); }
+    @Override protected void onResume() { 
+        super.onResume(); 
+        handler.post(tick); 
+        updateMediaState();
+    }
     @Override protected void onPause() {
         super.onPause();
         handler.removeCallbacks(tick);
@@ -352,6 +374,40 @@ public class MainActivity extends Activity {
         date = text(px(32), 0x99FFFFFF, "sans-serif-light");
         page.addView(date, lp(W / 2, px(44), px(80), px(232)));
 
+        // Widget de Música Glass Horizontal con Visualizador de Ondas estilo iPhone
+        int mw = px(680), mh = px(210);
+        mediaWidget = new FrameLayout(this);
+        mediaWidget.setBackground(rounded(0x33FFFFFF, px(30));
+        
+        albumArt = new ImageView(this);
+        albumArt.setBackground(rounded(0x22FFFFFF, px(16)));
+        albumArt.setClipToOutline(true);
+        albumArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        mediaWidget.addView(albumArt, lp(px(140), px(140), px(24), px(24)));
+
+        trackTitle = text(px(30), Color.WHITE, "sans-serif-bold");
+        trackArtist = text(px(24), 0xCCFFFFFF, "sans-serif");
+        mediaWidget.addView(trackTitle, lp(px(350), px(40), px(180), px(28)));
+        mediaWidget.addView(trackArtist, lp(px(350), px(34), px(180), px(72)));
+
+        // Contenedor de barras horizontales (Visualizador estilo onda)
+        waveContainer = new LinearLayout(this);
+        waveContainer.setOrientation(LinearLayout.HORIZONTAL);
+        waveContainer.setGravity(Gravity.BOTTOM);
+        waveBars.clear();
+        for (int i = 0; i < 32; i++) {
+            View bar = new View(this);
+            bar.setBackground(rounded(Color.WHITE, px(4)));
+            LinearLayout.LayoutParams lpBar = new LinearLayout.LayoutParams(px(6), px(20));
+            lpBar.setMargins(px(3), 0, px(3), 0);
+            waveContainer.addView(bar, lpBar);
+            waveBars.add(bar);
+        }
+        mediaWidget.addView(waveContainer, lp(px(460), px(40), px(180), px(124)));
+
+        mediaWidget.setVisibility(View.GONE);
+        page.addView(mediaWidget, lp(mw, mh, (W - mw) / 2, px(340)));
+
         String[] pt = { "Entradas", "Wi-Fi", "Configuración" };
         for (int i = 0; i < 3; i++) {
             TextView p = text(px(26), Color.WHITE, "sans-serif");
@@ -415,6 +471,39 @@ public class MainActivity extends Activity {
         setContentView(root);
         updateClock();
         updateFocus();
+    }
+
+    void updateMediaState() {
+        if (mediaManager == null) return;
+        try {
+            List<MediaController> controllers = mediaManager.getActiveSessions(null);
+            if (controllers != null && !controllers.isEmpty()) {
+                activeController = controllers.get(0);
+                MediaMetadata meta = activeController.getMetadata();
+                PlaybackState state = activeController.getPlaybackState();
+                if (meta != null && state != null && state.getState() == PlaybackState.STATE_PLAYING) {
+                    String title = meta.getString(MediaMetadata.METADATA_KEY_TITLE);
+                    String artist = meta.getString(MediaMetadata.METADATA_KEY_ARTIST);
+                    Bitmap art = meta.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
+                    if (art == null) art = meta.getBitmap(MediaMetadata.METADATA_KEY_ART);
+                    
+                    trackTitle.setText(title != null ? title : "Reproduciendo...");
+                    trackArtist.setText(artist != null ? artist : "Música de fondo");
+                    if (art != null) albumArt.setImageBitmap(art);
+
+                    // Animar aleatoriamente las barras de la onda de audio
+                    for (int i = 0; i < waveBars.size(); i++) {
+                        float randomH = px(8 + (int)(Math.random() * 28));
+                        waveBars.get(i).getLayoutParams().height = (int)randomH;
+                        waveBars.get(i).requestLayout();
+                    }
+
+                    mediaWidget.setVisibility(View.VISIBLE);
+                    return;
+                }
+            }
+        } catch (Throwable t) {}
+        mediaWidget.setVisibility(View.GONE);
     }
 
     void layoutPills() {
@@ -640,6 +729,17 @@ public class MainActivity extends Activity {
         buildUi();
     }
 
+    void uninstallApp() {
+        App a = (zone == DOCK) ? dock.get(dockIdx) : grid.get(gridIdx);
+        try {
+            Intent intent = new Intent(Intent.ACTION_DELETE);
+            intent.setData(Uri.parse("package:" + a.pkg));
+            startActivity(intent);
+        } catch (Throwable t) {
+            Toast.makeText(this, "No se pudo desinstalar " + a.label, Toast.LENGTH_SHORT).show();
+        }
+    }
+
     void addEntry(String label, Runnable r) {
         Entry e = new Entry();
         e.label = label;
@@ -654,12 +754,14 @@ public class MainActivity extends Activity {
             if (dock.isEmpty()) return;
             addEntry("Mover", new Runnable() { public void run() { startMove(); } });
             addEntry("Quitar del dock", new Runnable() { public void run() { removeFromDock(); } });
+            addEntry("Desinstalar app", new Runnable() { public void run() { uninstallApp(); } });
         } else {
             if (grid.isEmpty()) return;
             addEntry("Mover", new Runnable() { public void run() { startMove(); } });
             addEntry(dock.size() < 4 ? "Agregar al dock" : "Agregar al dock (cambia la última)",
                     new Runnable() { public void run() { addToDock(); } });
             addEntry("Ocultar", new Runnable() { public void run() { hideApp(); } });
+            addEntry("Desinstalar app", new Runnable() { public void run() { uninstallApp(); } });
         }
         if (hiddenInstalled > 0) {
             addEntry("Mostrar apps ocultas (" + hiddenInstalled + ")",
