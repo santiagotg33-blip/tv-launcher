@@ -84,7 +84,6 @@ public class MainActivity extends Activity {
     SharedPreferences prefs;
     BroadcastReceiver pkgReceiver;
 
-    // Media & Visualizer Widget
     MediaSessionManager mediaManager;
     MediaController activeController;
     FrameLayout mediaWidget;
@@ -374,10 +373,9 @@ public class MainActivity extends Activity {
         date = text(px(32), 0x99FFFFFF, "sans-serif-light");
         page.addView(date, lp(W / 2, px(44), px(80), px(232)));
 
-        // Widget de Música Glass Horizontal con Visualizador de Ondas estilo iPhone
         int mw = px(680), mh = px(210);
         mediaWidget = new FrameLayout(this);
-        mediaWidget.setBackground(rounded(0x33FFFFFF, px(30));
+        mediaWidget.setBackground(rounded(0x33FFFFFF, px(30)));
         
         albumArt = new ImageView(this);
         albumArt.setBackground(rounded(0x22FFFFFF, px(16)));
@@ -390,7 +388,6 @@ public class MainActivity extends Activity {
         mediaWidget.addView(trackTitle, lp(px(350), px(40), px(180), px(28)));
         mediaWidget.addView(trackArtist, lp(px(350), px(34), px(180), px(72)));
 
-        // Contenedor de barras horizontales (Visualizador estilo onda)
         waveContainer = new LinearLayout(this);
         waveContainer.setOrientation(LinearLayout.HORIZONTAL);
         waveContainer.setGravity(Gravity.BOTTOM);
@@ -491,7 +488,6 @@ public class MainActivity extends Activity {
                     trackArtist.setText(artist != null ? artist : "Música de fondo");
                     if (art != null) albumArt.setImageBitmap(art);
 
-                    // Animar aleatoriamente las barras de la onda de audio
                     for (int i = 0; i < waveBars.size(); i++) {
                         float randomH = px(8 + (int)(Math.random() * 28));
                         waveBars.get(i).getLayoutParams().height = (int)randomH;

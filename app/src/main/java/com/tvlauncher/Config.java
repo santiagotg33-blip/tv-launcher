@@ -6,7 +6,5 @@ public class Config {
         "org.xbmc.kodi", 
         "com.magis.tv"
     };
-
-    public static final String[] HIDE = {
-    };
+    public static final String[] HIDE = {};
 }
