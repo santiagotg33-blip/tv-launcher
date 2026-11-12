@@ -1600,8 +1600,13 @@ public class MainActivity extends Activity {
             v *= 0.85f + 0.5f * b / WAVE_N;
             out[b] = Math.min(1f, v);
         }
-        fftLevels = out;
-        fftTime = SystemClock.elapsedRealtime();
+        // Algunos TV entregan el audio en ceros: solo cuenta si hay senal real
+        float peak = 0f;
+        for (int i = 0; i < WAVE_N; i++) peak = Math.max(peak, out[i]);
+        if (peak > 0.06f) {
+            fftLevels = out;
+            fftTime = SystemClock.elapsedRealtime();
+        }
     }
 
     void animateWave() {
@@ -1617,7 +1622,8 @@ public class MainActivity extends Activity {
                     target = fl[i];
                 } else {
                     float a = (float) Math.abs(Math.sin(t * 3.1 + i * 0.55) * Math.cos(t * 1.7 + i * 0.31));
-                    target = 0.2f + 0.7f * a + (float) Math.random() * 0.1f;
+                    float beat = 0.55f + 0.45f * (float) Math.abs(Math.sin(t * 5.3));
+                    target = Math.min(1f, (0.25f + 0.75f * a) * beat + (float) Math.random() * 0.12f);
                 }
             }
             float cur = waveLevels[i];
