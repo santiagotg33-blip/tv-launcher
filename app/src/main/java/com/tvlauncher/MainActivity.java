@@ -1,21 +1,35 @@
 package com.tvlauncher;
 
+import android.Manifest;
 import android.app.Activity;
+import android.app.WallpaperManager;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Matrix;
 import android.graphics.Outline;
+import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.RadialGradient;
+import android.graphics.RectF;
+import android.graphics.Shader;
+import android.graphics.SurfaceTexture;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.media.MediaMetadata;
+import android.media.MediaPlayer;
+import android.media.audiofx.Visualizer;
 import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
 import android.media.session.PlaybackState;
@@ -27,23 +41,30 @@ import android.net.NetworkInfo;
 import android.net.Uri;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
+import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.Surface;
+import android.view.TextureView;
 import android.view.View;
 import android.view.ViewOutlineProvider;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
-import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
@@ -53,17 +74,159 @@ import java.util.List;
 import java.util.Locale;
 
 public class MainActivity extends Activity {
-    static final int TOP = 0, DOCK = 1, GRID = 2;
+    static final int TOP = 0, DOCK = 1, GRID = 2, MEDIA = 3;
+    static final int PILLS = 4;      // Fondos, Entradas, Red, Configuracion
+    static final int WAVE_N = 56;    // columnas de la onda
 
     static class App { String pkg, label; Drawable img; boolean banner; Intent launch; int glow; }
     static class Entry { String label; Intent intent; Intent fallback; Runnable action; }
 
+    // ---------- Vista: fondo animado tipo aurora ----------
+    static class AuroraView extends View {
+        static final float[] SX = { 0.30f, 0.41f, 0.23f, 0.50f };
+        static final float[] SY = { 0.37f, 0.25f, 0.45f, 0.31f };
+        static final float[] PH = { 0f, 1.9f, 3.7f, 5.1f };
+        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final int base;
+        final int[] cols;
+        RadialGradient[] g;
+        float r;
+        boolean running = true;
+        final long t0 = System.currentTimeMillis();
+
+        AuroraView(Context c, int base, int[] cols) {
+            super(c);
+            this.base = base;
+            this.cols = cols;
+        }
+
+        static int al(int c, int a) { return (a << 24) | (c & 0x00FFFFFF); }
+
+        void setRunning(boolean b) {
+            running = b;
+            if (b) invalidate();
+        }
+
+        @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
+            r = Math.max(w, h) * 0.28f;
+            g = new RadialGradient[cols.length];
+            for (int i = 0; i < cols.length; i++) {
+                g[i] = new RadialGradient(0, 0, r,
+                        new int[] { al(cols[i], 0xC8), al(cols[i], 0x66), al(cols[i], 0x00) },
+                        new float[] { 0f, 0.45f, 1f }, Shader.TileMode.CLAMP);
+            }
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            c.drawColor(base);
+            if (g == null) return;
+            float t = (System.currentTimeMillis() - t0) / 1000f;
+            int w = getWidth(), h = getHeight();
+            for (int i = 0; i < g.length; i++) {
+                float x = w * (0.5f + 0.42f * (float) Math.sin(t * SX[i] + PH[i]));
+                float y = h * (0.5f + 0.34f * (float) Math.cos(t * SY[i] + PH[i] * 1.7f));
+                c.save();
+                c.translate(x, y);
+                p.setShader(g[i]);
+                c.drawCircle(0, 0, r, p);
+                c.restore();
+            }
+            if (running) postInvalidateDelayed(40);
+        }
+    }
+
+    // ---------- Vista: onda de audio (barras cerca del punto de reproduccion + puntos) ----------
+    static class WaveView extends View {
+        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final RectF rf = new RectF();
+        final float[] lv;
+        final float dot;
+        float head = 0.5f;
+
+        WaveView(Context c, float[] lv, float dot) {
+            super(c);
+            this.lv = lv;
+            this.dot = dot;
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            int n = lv.length;
+            float w = getWidth(), h = getHeight();
+            float pitch = w / n, cy = h / 2f, barW = pitch * 0.46f;
+            float hp = head * (n - 1);
+            for (int i = 0; i < n; i++) {
+                float cx = pitch * (i + 0.5f);
+                float d = i - hp;
+                float env = (float) Math.exp(-(d * d) / 40f);
+                float bar = dot * 2f + (h - dot * 2f) * Math.min(1f, lv[i]) * env;
+                if (bar <= dot * 2f + 1f) {
+                    p.setColor(0xCCFFFFFF);
+                    c.drawCircle(cx, cy, dot, p);
+                } else {
+                    p.setColor(Color.WHITE);
+                    rf.set(cx - barW / 2f, cy - bar / 2f, cx + barW / 2f, cy + bar / 2f);
+                    c.drawRoundRect(rf, barW / 2f, barW / 2f, p);
+                }
+            }
+        }
+    }
+
+    // ---------- Vista: botones del reproductor (anterior / play-pausa / siguiente) ----------
+    static class Ctl extends View {
+        final int kind;
+        boolean playing = false;
+        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final Path path = new Path();
+
+        Ctl(Context c, int kind) {
+            super(c);
+            this.kind = kind;
+            p.setColor(Color.WHITE);
+            p.setStyle(Paint.Style.FILL);
+        }
+
+        void setPlaying(boolean b) {
+            if (b != playing) { playing = b; invalidate(); }
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            float cx = getWidth() / 2f, cy = getHeight() / 2f;
+            float s = Math.min(getWidth(), getHeight()) * 0.30f;
+            path.reset();
+            if (kind == 0) {
+                c.drawRect(cx - s, cy - s, cx - s + s * 0.30f, cy + s, p);
+                path.moveTo(cx + s, cy - s);
+                path.lineTo(cx - s * 0.55f, cy);
+                path.lineTo(cx + s, cy + s);
+                path.close();
+                c.drawPath(path, p);
+            } else if (kind == 2) {
+                c.drawRect(cx + s - s * 0.30f, cy - s, cx + s, cy + s, p);
+                path.moveTo(cx - s, cy - s);
+                path.lineTo(cx + s * 0.55f, cy);
+                path.lineTo(cx - s, cy + s);
+                path.close();
+                c.drawPath(path, p);
+            } else if (playing) {
+                c.drawRect(cx - s * 0.75f, cy - s, cx - s * 0.25f, cy + s, p);
+                c.drawRect(cx + s * 0.25f, cy - s, cx + s * 0.75f, cy + s, p);
+            } else {
+                path.moveTo(cx - s * 0.7f, cy - s);
+                path.lineTo(cx + s, cy);
+                path.lineTo(cx - s * 0.7f, cy + s);
+                path.close();
+                c.drawPath(path, p);
+            }
+        }
+    }
+
+    // ---------- Estado ----------
     int W, H;
     float u;
-    FrameLayout root, page;
+    FrameLayout root, page, bgHolder;
     View glass, glow, menuPanel;
     TextView greeting, clock, date, dockName;
-    final TextView[] pills = new TextView[3];
+    final TextView[] pills = new TextView[PILLS];
     final List<App> dock = new ArrayList<App>();
     final List<App> grid = new ArrayList<App>();
     final List<View> dockViews = new ArrayList<View>();
@@ -71,9 +234,10 @@ public class MainActivity extends Activity {
     final List<TextView> gridLabels = new ArrayList<TextView>();
     final List<Entry> entries = new ArrayList<Entry>();
     final List<TextView> menuRows = new ArrayList<TextView>();
-    int zone = DOCK, topIdx = 0, dockIdx = 0, gridIdx = 0, menuIdx = 0;
+    int zone = DOCK, topIdx = 0, dockIdx = 0, gridIdx = 0, mediaIdx = 1, menuIdx = 0;
+    int menuStart = 0, menuVis = 0, wpCur = 0;
     boolean menuOpen = false;
-    boolean moving = false, centerDown = false, longFired = false;
+    boolean moving = false, centerDown = false, longFired = false, paused = false;
     int hiddenInstalled = 0;
     int gridTop, pitch;
     int cell, tw, th, bandX, bandY, bandH, gcw, gtw, gth, gx0;
@@ -84,17 +248,38 @@ public class MainActivity extends Activity {
     SharedPreferences prefs;
     BroadcastReceiver pkgReceiver;
 
+    // Widget multimedia
     MediaSessionManager mediaManager;
-    MediaController activeController;
+    ComponentName listenerCn;
+    MediaController ctl;
     FrameLayout mediaWidget;
     ImageView albumArt;
-    TextView trackTitle, trackArtist;
-    LinearLayout waveContainer;
-    final List<View> waveBars = new ArrayList<View>();
+    TextView trackAlbum, trackTitle, trackArtist, trackApp;
+    WaveView wave;
+    final List<Ctl> ctlViews = new ArrayList<Ctl>();
+    final float[] waveLevels = new float[WAVE_N];
+    volatile float[] fftLevels = new float[WAVE_N];
+    volatile long fftTime = 0;
+    Visualizer viz;
+    boolean vizOn = false, vizFailed = false;
+    boolean isPlaying = false, listenerMissing = false;
+    long posMs = -1, posBase = 0, durMs = -1;
+    float speed = 1f;
+    String lastArtKey = "";
+
+    // Fondo
+    AuroraView aurora;
+    MediaPlayer player;
+    int bgToken = 0;
+    Bitmap bgCache;
+    String bgCachePath;
 
     final Runnable rebuild = new Runnable() { public void run() { buildUi(); } };
-    final Runnable tick = new Runnable() {
-        public void run() { updateClock(); updateMediaState(); handler.postDelayed(this, 1500); }
+    final Runnable tickSlow = new Runnable() {
+        public void run() { updateClock(); pollMedia(); handler.postDelayed(this, 1000); }
+    };
+    final Runnable tickFast = new Runnable() {
+        public void run() { animateWave(); handler.postDelayed(this, 45); }
     };
     final Runnable longPress = new Runnable() {
         public void run() {
@@ -112,7 +297,8 @@ public class MainActivity extends Activity {
         face = loadFace();
         try {
             mediaManager = (MediaSessionManager) getSystemService(Context.MEDIA_SESSION_SERVICE);
-        } catch (Throwable t) {}
+        } catch (Throwable t) { }
+        listenerCn = new ComponentName(this, MediaListener.class);
         buildUi();
         pkgReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context c, Intent i) {
@@ -128,18 +314,33 @@ public class MainActivity extends Activity {
         registerReceiver(pkgReceiver, f);
     }
 
-    @Override protected void onResume() { 
-        super.onResume(); 
-        handler.post(tick); 
-        updateMediaState();
+    @Override protected void onResume() {
+        super.onResume();
+        paused = false;
+        vizFailed = false;
+        handler.removeCallbacks(tickSlow);
+        handler.removeCallbacks(tickFast);
+        handler.post(tickSlow);
+        handler.post(tickFast);
+        if (aurora != null) aurora.setRunning(true);
+        if (player != null) { try { player.start(); } catch (Throwable t) { } }
     }
+
     @Override protected void onPause() {
         super.onPause();
-        handler.removeCallbacks(tick);
+        paused = true;
+        handler.removeCallbacks(tickSlow);
+        handler.removeCallbacks(tickFast);
         handler.removeCallbacks(longPress);
+        releaseViz();
+        if (aurora != null) aurora.setRunning(false);
+        if (player != null) { try { player.pause(); } catch (Throwable t) { } }
     }
+
     @Override protected void onDestroy() {
         super.onDestroy();
+        releaseViz();
+        clearBg();
         try { unregisterReceiver(pkgReceiver); } catch (Throwable t) { }
     }
 
@@ -151,11 +352,22 @@ public class MainActivity extends Activity {
         updateFocus();
     }
 
+    public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
+        if (code == 77) {
+            if (res != null && res.length > 0 && res[0] == PackageManager.PERMISSION_GRANTED) {
+                openWallpaperMenu();
+            } else {
+                Toast.makeText(this, "Sin permiso no puedo ver tus imagenes", Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
     Typeface loadFace() {
         try { return Typeface.createFromAsset(getAssets(), "fonts/chubby.ttf"); }
         catch (Throwable t) { return Typeface.create("sans-serif-black", Typeface.NORMAL); }
     }
 
+    // ---------- Utilidades de dibujo ----------
     int px(float v) { return Math.round(v * u); }
 
     FrameLayout.LayoutParams lp(int w, int h, int x, int y) {
@@ -173,13 +385,23 @@ public class MainActivity extends Activity {
         return g;
     }
 
-    TextView text(float sizePx, int color, String family) {
+    /** Efecto "glass": degradado translucido + borde fino brillante (sin blur real). */
+    GradientDrawable glassFill(float r, int top, int bottom, int stroke) {
+        GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[] { top, bottom });
+        g.setCornerRadius(r);
+        g.setStroke(Math.max(2, px(2)), stroke);
+        return g;
+    }
+
+    TextView text(float sizePx, int color) {
         TextView t = new TextView(this);
         t.setTextSize(TypedValue.COMPLEX_UNIT_PX, sizePx);
         t.setTextColor(color);
         t.setTypeface(face);
         t.setIncludeFontPadding(false);
         t.setSingleLine(true);
+        t.setEllipsize(TextUtils.TruncateAt.END);
         return t;
     }
 
@@ -214,6 +436,7 @@ public class MainActivity extends Activity {
         return 0xFF4A90E2;
     }
 
+    // ---------- Datos de apps ----------
     String[] parts(String s) {
         if (s == null || s.length() == 0) return new String[0];
         return s.split(",");
@@ -301,10 +524,13 @@ public class MainActivity extends Activity {
         grid.addAll(og);
     }
 
+    boolean hasMedia() { return ctl != null && !ctlViews.isEmpty(); }
+
     void clampState() {
+        if (zone == MEDIA && !hasMedia()) zone = dock.isEmpty() ? (grid.isEmpty() ? TOP : GRID) : DOCK;
         if (zone == DOCK && dock.isEmpty()) zone = grid.isEmpty() ? TOP : GRID;
         if (zone == GRID && grid.isEmpty()) zone = dock.isEmpty() ? TOP : DOCK;
-        topIdx = clampi(topIdx, 0, 2);
+        topIdx = clampi(topIdx, 0, PILLS - 1);
         dockIdx = clampi(dockIdx, 0, Math.max(0, dock.size() - 1));
         gridIdx = clampi(gridIdx, 0, Math.max(0, grid.size() - 1));
     }
@@ -348,75 +574,57 @@ public class MainActivity extends Activity {
         lab.setLayoutParams(m);
     }
 
+    // ---------- Construccion de la interfaz ----------
     void buildUi() {
         DisplayMetrics dm = getResources().getDisplayMetrics();
         W = dm.widthPixels;
         H = dm.heightPixels;
         u = H / 1080f;
         dock.clear(); grid.clear(); dockViews.clear(); gridViews.clear(); gridLabels.clear();
+        ctlViews.clear();
+        lastArtKey = "";
         menuOpen = false; menuPanel = null; lastNet = ""; moving = false;
         loadApps();
         clampState();
 
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
+
+        // Fondo (imagen / animado / video) + capa oscura suave para que se lea el texto
+        bgHolder = new FrameLayout(this);
+        root.addView(bgHolder, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        View scrim = new View(this);
+        scrim.setBackgroundColor(0x40000000);
+        root.addView(scrim, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
         pitch = px(230);
         gridTop = H + px(40);
         int rows = Math.max(1, (grid.size() + 3) / 4);
         page = new FrameLayout(this);
         root.addView(page, new FrameLayout.LayoutParams(W, gridTop + rows * pitch + px(300)));
 
-        greeting = text(px(34), 0xB3FFFFFF, "sans-serif-light");
+        greeting = text(px(34), 0xB3FFFFFF);
         page.addView(greeting, lp(W / 2, px(46), px(80), px(56)));
-        clock = text(px(110), Color.WHITE, "sans-serif-thin");
+        clock = text(px(110), Color.WHITE);
         page.addView(clock, lp(W / 2, px(130), px(74), px(96)));
-        date = text(px(32), 0x99FFFFFF, "sans-serif-light");
+        date = text(px(32), 0x99FFFFFF);
         page.addView(date, lp(W / 2, px(44), px(80), px(232)));
 
-        int mw = px(680), mh = px(210);
-        mediaWidget = new FrameLayout(this);
-        mediaWidget.setBackground(rounded(0x33FFFFFF, px(30)));
-        
-        albumArt = new ImageView(this);
-        albumArt.setBackground(rounded(0x22FFFFFF, px(16)));
-        albumArt.setClipToOutline(true);
-        albumArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        mediaWidget.addView(albumArt, lp(px(140), px(140), px(24), px(24)));
-
-        trackTitle = text(px(30), Color.WHITE, "sans-serif-bold");
-        trackArtist = text(px(24), 0xCCFFFFFF, "sans-serif");
-        mediaWidget.addView(trackTitle, lp(px(350), px(40), px(180), px(28)));
-        mediaWidget.addView(trackArtist, lp(px(350), px(34), px(180), px(72)));
-
-        waveContainer = new LinearLayout(this);
-        waveContainer.setOrientation(LinearLayout.HORIZONTAL);
-        waveContainer.setGravity(Gravity.BOTTOM);
-        waveBars.clear();
-        for (int i = 0; i < 32; i++) {
-            View bar = new View(this);
-            bar.setBackground(rounded(Color.WHITE, px(4)));
-            LinearLayout.LayoutParams lpBar = new LinearLayout.LayoutParams(px(6), px(20));
-            lpBar.setMargins(px(3), 0, px(3), 0);
-            waveContainer.addView(bar, lpBar);
-            waveBars.add(bar);
-        }
-        mediaWidget.addView(waveContainer, lp(px(460), px(40), px(180), px(124)));
-
-        mediaWidget.setVisibility(View.GONE);
-        page.addView(mediaWidget, lp(mw, mh, (W - mw) / 2, px(340)));
-
-        String[] pt = { "Entradas", "Wi-Fi", "Configuración" };
-        for (int i = 0; i < 3; i++) {
-            TextView p = text(px(26), Color.WHITE, "sans-serif");
+        String[] pt = { "Fondos", "Entradas", "Wi-Fi", "Configuración" };
+        for (int i = 0; i < PILLS; i++) {
+            TextView p = text(px(26), Color.WHITE);
             p.setText(pt[i]);
             p.setGravity(Gravity.CENTER);
             p.setPadding(px(34), 0, px(34), 0);
-            p.setBackground(rounded(0x26FFFFFF, px(34)));
+            p.setBackground(glassFill(px(34), 0x40FFFFFF, 0x18FFFFFF, 0x55FFFFFF));
             pills[i] = p;
             page.addView(p, lp(px(200), px(68), 0, px(64)));
         }
         layoutPills();
 
+        // Dock (franja inferior de vidrio)
         cell = px(230);
         tw = px(190);
         th = px(107);
@@ -425,11 +633,14 @@ public class MainActivity extends Activity {
         bandX = (W - bandW) / 2;
         bandY = H - px(250);
         View band = new View(this);
-        band.setBackground(rounded(0x1FFFFFFF, px(48)));
+        band.setBackground(glassFill(px(48), 0x33FFFFFF, 0x14FFFFFF, 0x44FFFFFF));
         page.addView(band, lp(bandW, bandH, bandX, bandY));
         glow = new View(this);
         page.addView(glow, lp(px(900), px(520), (W - px(900)) / 2, bandY - px(350)));
-        dockName = text(px(64), Color.WHITE, "sans-serif-light");
+
+        buildMediaWidget();
+
+        dockName = text(px(64), Color.WHITE);
         dockName.setGravity(Gravity.CENTER);
         page.addView(dockName, lp(W, px(80), 0, bandY - px(130)));
         for (int i = 0; i < dock.size(); i++) {
@@ -447,7 +658,7 @@ public class MainActivity extends Activity {
             ImageView t = tile(grid.get(i), px(18));
             page.addView(t, lp(gtw, gth, 0, 0));
             gridViews.add(t);
-            TextView l = text(px(26), Color.WHITE, "sans-serif");
+            TextView l = text(px(26), Color.WHITE);
             l.setText(grid.get(i).label);
             l.setGravity(Gravity.CENTER);
             l.setVisibility(View.INVISIBLE);
@@ -456,8 +667,8 @@ public class MainActivity extends Activity {
             placeGrid(i);
         }
 
-        glassNormalBg = rounded(0x33FFFFFF, px(24));
-        glassNormalBg.setStroke(px(3), 0xAAFFFFFF);
+        glassNormalBg = glassFill(px(24), 0x40FFFFFF, 0x20FFFFFF, 0xDDFFFFFF);
+        glassNormalBg.setStroke(Math.max(3, px(3)), 0xDDFFFFFF);
         glassMoveBg = rounded(0x40FFD60A, px(26));
         glassMoveBg.setStroke(px(4), 0xFFFFD60A);
         glass = new View(this);
@@ -466,45 +677,59 @@ public class MainActivity extends Activity {
         page.addView(glass, lp(10, 10, 0, 0));
 
         setContentView(root);
+        applyWallpaper();
         updateClock();
+        pollMedia();
         updateFocus();
     }
 
-    void updateMediaState() {
-        if (mediaManager == null) return;
-        try {
-            List<MediaController> controllers = mediaManager.getActiveSessions(null);
-            if (controllers != null && !controllers.isEmpty()) {
-                activeController = controllers.get(0);
-                MediaMetadata meta = activeController.getMetadata();
-                PlaybackState state = activeController.getPlaybackState();
-                if (meta != null && state != null && state.getState() == PlaybackState.STATE_PLAYING) {
-                    String title = meta.getString(MediaMetadata.METADATA_KEY_TITLE);
-                    String artist = meta.getString(MediaMetadata.METADATA_KEY_ARTIST);
-                    Bitmap art = meta.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
-                    if (art == null) art = meta.getBitmap(MediaMetadata.METADATA_KEY_ART);
-                    
-                    trackTitle.setText(title != null ? title : "Reproduciendo...");
-                    trackArtist.setText(artist != null ? artist : "Música de fondo");
-                    if (art != null) albumArt.setImageBitmap(art);
+    void buildMediaWidget() {
+        int mw = px(980), mh = px(330);
+        mediaWidget = new FrameLayout(this);
+        mediaWidget.setBackground(glassFill(px(36), 0x4DFFFFFF, 0x1AFFFFFF, 0x77FFFFFF));
 
-                    for (int i = 0; i < waveBars.size(); i++) {
-                        float randomH = px(8 + (int)(Math.random() * 28));
-                        waveBars.get(i).getLayoutParams().height = (int)randomH;
-                        waveBars.get(i).requestLayout();
-                    }
-
-                    mediaWidget.setVisibility(View.VISIBLE);
-                    return;
-                }
+        // 1) Caratula a la izquierda
+        albumArt = new ImageView(this);
+        albumArt.setBackground(rounded(0x33FFFFFF, px(18)));
+        albumArt.setClipToOutline(true);
+        albumArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        albumArt.setOutlineProvider(new ViewOutlineProvider() {
+            @Override public void getOutline(View v, Outline o) {
+                o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), px(18));
             }
-        } catch (Throwable t) {}
-        mediaWidget.setVisibility(View.GONE);
+        });
+        mediaWidget.addView(albumArt, lp(px(170), px(170), px(30), px(26)));
+
+        // 2) Album / cancion / artista / app en el centro
+        int tx = px(230), tw2 = mw - px(230) - px(30);
+        trackAlbum = text(px(24), 0xB3FFFFFF);
+        trackTitle = text(px(46), Color.WHITE);
+        trackArtist = text(px(30), 0xCCFFFFFF);
+        trackApp = text(px(26), 0x99FFFFFF);
+        mediaWidget.addView(trackAlbum, lp(tw2, px(30), tx, px(28)));
+        mediaWidget.addView(trackTitle, lp(tw2, px(58), tx, px(60)));
+        mediaWidget.addView(trackArtist, lp(tw2, px(38), tx, px(122)));
+        mediaWidget.addView(trackApp, lp(tw2, px(32), tx, px(164)));
+
+        // 3) Onda de audio horizontal (barras + puntos)
+        wave = new WaveView(this, waveLevels, px(3.5f));
+        mediaWidget.addView(wave, lp(mw - px(60), px(56), px(30), px(204)));
+
+        // 4) Botones: anterior / play-pausa / siguiente
+        for (int k = 0; k < 3; k++) {
+            Ctl c = new Ctl(this, k);
+            c.setVisibility(View.INVISIBLE);
+            mediaWidget.addView(c, lp(px(60), px(60), mw / 2 - px(30) + (k - 1) * px(120), px(266)));
+            ctlViews.add(c);
+        }
+
+        page.addView(mediaWidget, lp(mw, mh, (W - mw) / 2, px(290)));
+        applyTrackTexts("", "Sin reproducción", "Abre Spotify o Kodi", "");
     }
 
     void layoutPills() {
         int x = W - px(80);
-        for (int i = 2; i >= 0; i--) {
+        for (int i = PILLS - 1; i >= 0; i--) {
             TextView p = pills[i];
             p.measure(0, 0);
             int w = p.getMeasuredWidth();
@@ -519,6 +744,474 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------- Fondos de pantalla ----------
+    void clearBg() {
+        bgToken++;
+        releasePlayer();
+        aurora = null;
+        if (bgHolder != null) bgHolder.removeAllViews();
+    }
+
+    void releasePlayer() {
+        if (player != null) {
+            try { player.stop(); } catch (Throwable t) { }
+            try { player.release(); } catch (Throwable t) { }
+            player = null;
+        }
+    }
+
+    FrameLayout.LayoutParams matchParent() {
+        return new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
+    }
+
+    void applyWallpaper() {
+        if (bgHolder == null) return;
+        clearBg();
+        bgHolder.setBackgroundColor(Color.BLACK);
+        String type = prefs.getString("wp_type", "anim");
+        String val = prefs.getString("wp_val", "aurora_verde");
+        if ("none".equals(type)) return;
+        if ("image".equals(type)) imageBg(val);
+        else if ("video".equals(type)) videoBg(val);
+        else if ("system".equals(type)) systemBg();
+        else animBg(val);
+    }
+
+    void animBg(String id) {
+        int base;
+        int[] cols;
+        if ("aurora_azul".equals(id)) {
+            base = 0xFF020716;
+            cols = new int[] { 0xFF1E90FF, 0xFF00D4FF, 0xFF5B5BFF, 0xFF0A4FA8 };
+        } else if ("aurora_violeta".equals(id)) {
+            base = 0xFF0A0314;
+            cols = new int[] { 0xFFB04DFF, 0xFFFF4DC8, 0xFF5B3BFF, 0xFF7A1FA2 };
+        } else if ("atardecer".equals(id)) {
+            base = 0xFF14040A;
+            cols = new int[] { 0xFFFF6A00, 0xFFFF2D55, 0xFFFFB300, 0xFF8E24AA };
+        } else if ("oceano".equals(id)) {
+            base = 0xFF010E14;
+            cols = new int[] { 0xFF00BFA5, 0xFF0097FF, 0xFF00E5FF, 0xFF006064 };
+        } else {
+            base = 0xFF03120A;
+            cols = new int[] { 0xFF00E060, 0xFF12B886, 0xFF7CFF3A, 0xFF0B8F4A };
+        }
+        AuroraView v = new AuroraView(this, base, cols);
+        aurora = v;
+        v.setRunning(!paused);
+        bgHolder.addView(v, matchParent());
+    }
+
+    void showBitmap(Bitmap bm) {
+        ImageView iv = new ImageView(this);
+        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        iv.setImageBitmap(bm);
+        iv.setAlpha(0f);
+        bgHolder.addView(iv, matchParent());
+        iv.animate().alpha(1f).setDuration(400).start();
+    }
+
+    void imageBg(final String path) {
+        if (bgCache != null && path.equals(bgCachePath)) { showBitmap(bgCache); return; }
+        if (!new File(path).exists()) {
+            Toast.makeText(this, "No encuentro esa imagen", Toast.LENGTH_SHORT).show();
+            animBg("aurora_verde");
+            return;
+        }
+        final int token = bgToken;
+        final int sw = W, sh = H;
+        new Thread(new Runnable() {
+            public void run() {
+                Bitmap bm = null;
+                try {
+                    BitmapFactory.Options o = new BitmapFactory.Options();
+                    o.inJustDecodeBounds = true;
+                    BitmapFactory.decodeFile(path, o);
+                    int s = 1;
+                    while (o.outWidth / (s * 2) >= sw && o.outHeight / (s * 2) >= sh) s *= 2;
+                    BitmapFactory.Options o2 = new BitmapFactory.Options();
+                    o2.inSampleSize = s;
+                    bm = BitmapFactory.decodeFile(path, o2);
+                } catch (Throwable t) { bm = null; }
+                final Bitmap result = bm;
+                handler.post(new Runnable() {
+                    public void run() {
+                        if (token != bgToken || bgHolder == null) return;
+                        if (result == null) {
+                            Toast.makeText(MainActivity.this, "No pude abrir la imagen", Toast.LENGTH_SHORT).show();
+                            animBg("aurora_verde");
+                        } else {
+                            bgCache = result;
+                            bgCachePath = path;
+                            showBitmap(result);
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    void systemBg() {
+        try {
+            Drawable d = WallpaperManager.getInstance(this).getDrawable();
+            if (d == null) throw new RuntimeException("sin fondo");
+            ImageView iv = new ImageView(this);
+            iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            iv.setImageDrawable(d);
+            bgHolder.addView(iv, matchParent());
+        } catch (Throwable t) {
+            Toast.makeText(this, "No pude leer el fondo del sistema", Toast.LENGTH_SHORT).show();
+            animBg("aurora_verde");
+        }
+    }
+
+    void videoBg(final String path) {
+        if (!new File(path).exists()) {
+            Toast.makeText(this, "No encuentro ese video", Toast.LENGTH_SHORT).show();
+            animBg("aurora_verde");
+            return;
+        }
+        final TextureView tv = new TextureView(this);
+        bgHolder.addView(tv, matchParent());
+        tv.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+            public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) { startVideo(tv, st, path); }
+            public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int h) { }
+            public boolean onSurfaceTextureDestroyed(SurfaceTexture st) { releasePlayer(); return true; }
+            public void onSurfaceTextureUpdated(SurfaceTexture st) { }
+        });
+    }
+
+    void startVideo(final TextureView tv, SurfaceTexture st, String path) {
+        try {
+            releasePlayer();
+            MediaPlayer mp = new MediaPlayer();
+            player = mp;
+            mp.setSurface(new Surface(st));
+            mp.setDataSource(path);
+            mp.setLooping(true);
+            mp.setVolume(0f, 0f);   // sin sonido y sin quitarle el audio a Spotify
+            mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
+                public void onPrepared(MediaPlayer m) {
+                    fitVideo(tv, m.getVideoWidth(), m.getVideoHeight());
+                    if (!paused) m.start();
+                }
+            });
+            mp.setOnErrorListener(new MediaPlayer.OnErrorListener() {
+                public boolean onError(MediaPlayer m, int what, int extra) {
+                    handler.post(new Runnable() {
+                        public void run() {
+                            Toast.makeText(MainActivity.this, "No pude reproducir ese video", Toast.LENGTH_SHORT).show();
+                            clearBg();
+                            animBg("aurora_verde");
+                        }
+                    });
+                    return true;
+                }
+            });
+            mp.prepareAsync();
+        } catch (Throwable t) {
+            Toast.makeText(this, "No pude reproducir ese video", Toast.LENGTH_SHORT).show();
+            animBg("aurora_verde");
+        }
+    }
+
+    void fitVideo(TextureView tv, int vw, int vh) {
+        int w = tv.getWidth(), h = tv.getHeight();
+        if (vw <= 0 || vh <= 0 || w <= 0 || h <= 0) return;
+        float va = vw / (float) vh, ca = w / (float) h;
+        float sx = 1f, sy = 1f;
+        if (va > ca) sx = va / ca; else sy = ca / va;
+        Matrix m = new Matrix();
+        m.setScale(sx, sy, w / 2f, h / 2f);
+        tv.setTransform(m);
+    }
+
+    boolean hasStorage() {
+        if (Build.VERSION.SDK_INT < 23) return true;
+        return checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    void requestStorage() {
+        if (Build.VERSION.SDK_INT >= 23) {
+            requestPermissions(new String[] { Manifest.permission.READ_EXTERNAL_STORAGE }, 77);
+        }
+    }
+
+    void scanFiles(File dir, int depth, List<String[]> out, HashSet<String> seen) {
+        if (dir == null || depth > 3 || out.size() >= 80) return;
+        File[] fs = dir.listFiles();
+        if (fs == null) return;
+        Arrays.sort(fs);
+        for (File f : fs) {
+            if (out.size() >= 80) return;
+            String name = f.getName();
+            if (name.startsWith(".")) continue;
+            if (f.isDirectory()) {
+                if (!name.equalsIgnoreCase("Android")) scanFiles(f, depth + 1, out, seen);
+                continue;
+            }
+            String n = name.toLowerCase(Locale.US);
+            String kind = null;
+            if (n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png")
+                    || n.endsWith(".webp") || n.endsWith(".bmp")) kind = "image";
+            else if (n.endsWith(".mp4") || n.endsWith(".webm") || n.endsWith(".mkv")
+                    || n.endsWith(".3gp")) kind = "video";
+            if (kind != null && seen.add(f.getAbsolutePath())) {
+                out.add(new String[] { kind, f.getAbsolutePath(), name });
+            }
+        }
+    }
+
+    void addWp(String label, String type, final String val) {
+        final String ty = type;
+        boolean cur = ty.equals(prefs.getString("wp_type", "anim"))
+                && (ty.equals("none") || ty.equals("system")
+                || val.equals(prefs.getString("wp_val", "aurora_verde")));
+        if (cur) wpCur = entries.size();
+        addEntry((cur ? "• " : "   ") + label, new Runnable() {
+            public void run() { setWallpaper(ty, val); }
+        });
+    }
+
+    void setWallpaper(String type, String val) {
+        prefs.edit().putString("wp_type", type).putString("wp_val", val).apply();
+        applyWallpaper();
+    }
+
+    void openWallpaperMenu() {
+        if (menuOpen || moving) return;
+        entries.clear();
+        wpCur = 0;
+        addWp("Animado: Aurora verde", "anim", "aurora_verde");
+        addWp("Animado: Aurora azul", "anim", "aurora_azul");
+        addWp("Animado: Aurora violeta", "anim", "aurora_violeta");
+        addWp("Animado: Atardecer", "anim", "atardecer");
+        addWp("Animado: Océano", "anim", "oceano");
+        addWp("Fondo del sistema (Android)", "system", "");
+        addWp("Negro", "none", "");
+        if (hasStorage()) {
+            List<String[]> files = new ArrayList<String[]>();
+            HashSet<String> seen = new HashSet<String>();
+            File ext = Environment.getExternalStorageDirectory();
+            String[] roots = { "Pictures", "Download", "DCIM", "Wallpapers", "Fondos", "Movies" };
+            for (String r : roots) scanFiles(new File(ext, r), 0, files, seen);
+            for (String[] f : files) {
+                addWp(("video".equals(f[0]) ? "Video: " : "Imagen: ") + f[2], f[0], f[1]);
+            }
+            if (files.isEmpty()) {
+                addEntry("   (No hay imágenes en Pictures ni Download)", null);
+            }
+        } else {
+            addEntry("Permitir acceso a mis imágenes", new Runnable() {
+                public void run() { requestStorage(); }
+            });
+        }
+        showPanel(true, 760, wpCur);
+    }
+
+    // ---------- Widget multimedia ----------
+    void applyTrackTexts(String album, String title, String artist, String app) {
+        if (trackTitle == null) return;
+        trackAlbum.setText(album);
+        trackTitle.setText(title);
+        trackArtist.setText(artist);
+        trackApp.setText(app);
+    }
+
+    void pollMedia() {
+        if (trackTitle == null) return;
+        MediaController best = null;
+        boolean playing = false;
+        if (mediaManager != null) {
+            try {
+                List<MediaController> cs = mediaManager.getActiveSessions(listenerCn);
+                listenerMissing = false;
+                if (cs != null) {
+                    for (MediaController c : cs) {
+                        PlaybackState s = c.getPlaybackState();
+                        if (s == null) continue;
+                        int st = s.getState();
+                        if (st == PlaybackState.STATE_PLAYING) { best = c; playing = true; break; }
+                        if (best == null && (st == PlaybackState.STATE_PAUSED
+                                || st == PlaybackState.STATE_BUFFERING)) best = c;
+                    }
+                }
+            } catch (SecurityException e) {
+                listenerMissing = true;
+            } catch (Throwable t) { }
+        }
+        ctl = best;
+        isPlaying = playing;
+
+        String album = "", title, artist, app = "";
+        Bitmap art = null;
+        Drawable appIcon = null;
+        String artKey = "none";
+        durMs = -1;
+        posMs = -1;
+        if (best == null) {
+            title = "Sin reproducción";
+            artist = listenerMissing ? "Falta activar el acceso a notificaciones" : "Abre Spotify o Kodi";
+        } else {
+            title = "Reproduciendo";
+            artist = "";
+            try {
+                MediaMetadata m = best.getMetadata();
+                if (m != null) {
+                    String t = m.getString(MediaMetadata.METADATA_KEY_TITLE);
+                    String a = m.getString(MediaMetadata.METADATA_KEY_ARTIST);
+                    if (a == null || a.length() == 0) a = m.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST);
+                    String al = m.getString(MediaMetadata.METADATA_KEY_ALBUM);
+                    if (t != null && t.length() > 0) title = t;
+                    if (a != null) artist = a;
+                    if (al != null) album = al;
+                    art = m.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
+                    if (art == null) art = m.getBitmap(MediaMetadata.METADATA_KEY_ART);
+                    if (art == null) art = m.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON);
+                    durMs = m.getLong(MediaMetadata.METADATA_KEY_DURATION);
+                }
+                PlaybackState s = best.getPlaybackState();
+                if (s != null && s.getPosition() >= 0) {
+                    speed = s.getPlaybackSpeed();
+                    long p = s.getPosition();
+                    if (playing) {
+                        p += (long) ((SystemClock.elapsedRealtime() - s.getLastPositionUpdateTime()) * speed);
+                    }
+                    posMs = p;
+                    posBase = SystemClock.elapsedRealtime();
+                }
+            } catch (Throwable t) { }
+            try {
+                PackageManager pm = getPackageManager();
+                String pkg = best.getPackageName();
+                app = String.valueOf(pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)));
+                appIcon = pm.getApplicationIcon(pkg);
+                artKey = art != null ? "b" + System.identityHashCode(art) : "i" + pkg;
+            } catch (Throwable t) { artKey = art != null ? "b" + System.identityHashCode(art) : "app"; }
+        }
+        applyTrackTexts(album, title, artist, app);
+
+        if (!artKey.equals(lastArtKey)) {
+            lastArtKey = artKey;
+            if (art != null) {
+                albumArt.setImageBitmap(art);
+            } else if (appIcon != null) {
+                albumArt.setImageDrawable(appIcon);
+            } else {
+                albumArt.setImageDrawable(null);
+            }
+        }
+
+        boolean has = best != null;
+        for (Ctl c : ctlViews) c.setVisibility(has ? View.VISIBLE : View.INVISIBLE);
+        if (ctlViews.size() > 1) ctlViews.get(1).setPlaying(playing);
+
+        ensureViz(playing);
+        if (zone == MEDIA && !has) {
+            zone = dock.isEmpty() ? (grid.isEmpty() ? TOP : GRID) : DOCK;
+            updateFocus();
+        }
+    }
+
+    void ensureViz(boolean want) {
+        if (!want) { releaseViz(); return; }
+        if (viz != null || vizFailed) return;
+        Visualizer v = null;
+        try {
+            v = new Visualizer(0);   // 0 = mezcla de salida (lo que suena en el TV)
+            int[] r = Visualizer.getCaptureSizeRange();
+            v.setCaptureSize(r[1]);
+            v.setDataCaptureListener(new Visualizer.OnDataCaptureListener() {
+                public void onWaveFormDataCapture(Visualizer vz, byte[] w, int sr) { }
+                public void onFftDataCapture(Visualizer vz, byte[] fft, int sr) { handleFft(fft); }
+            }, Visualizer.getMaxCaptureRate(), false, true);
+            v.setEnabled(true);
+            viz = v;
+            vizOn = true;
+        } catch (Throwable t) {
+            if (v != null) { try { v.release(); } catch (Throwable t2) { } }
+            viz = null;
+            vizOn = false;
+            vizFailed = true;   // sin permiso de microfono: se usa onda simulada
+        }
+    }
+
+    void releaseViz() {
+        if (viz != null) {
+            try { viz.setEnabled(false); } catch (Throwable t) { }
+            try { viz.release(); } catch (Throwable t) { }
+            viz = null;
+        }
+        vizOn = false;
+    }
+
+    void handleFft(byte[] fft) {
+        int bins = fft.length / 2;
+        float[] out = new float[WAVE_N];
+        double maxBin = Math.min(bins - 1, 300);
+        for (int b = 0; b < WAVE_N; b++) {
+            int lo = (int) Math.round(Math.pow(maxBin, b / (double) WAVE_N));
+            int hi = (int) Math.round(Math.pow(maxBin, (b + 1) / (double) WAVE_N));
+            if (lo < 1) lo = 1;
+            if (hi <= lo) hi = lo + 1;
+            float m = 0f;
+            for (int k = lo; k < hi && 2 * k + 1 < fft.length; k++) {
+                float re = fft[2 * k], im = fft[2 * k + 1];
+                m = Math.max(m, (float) Math.sqrt(re * re + im * im));
+            }
+            float v = (float) (Math.log10(1.0 + m) / 2.0);
+            v *= 0.85f + 0.5f * b / WAVE_N;
+            out[b] = Math.min(1f, v);
+        }
+        fftLevels = out;
+        fftTime = SystemClock.elapsedRealtime();
+    }
+
+    void animateWave() {
+        if (wave == null) return;
+        float t = System.currentTimeMillis() / 1000f;
+        float[] fl = fftLevels;
+        boolean fresh = vizOn && (SystemClock.elapsedRealtime() - fftTime) < 400;
+        boolean any = false;
+        for (int i = 0; i < WAVE_N; i++) {
+            float target = 0f;
+            if (isPlaying) {
+                if (fresh) {
+                    target = fl[i];
+                } else {
+                    float a = (float) Math.abs(Math.sin(t * 3.1 + i * 0.55) * Math.cos(t * 1.7 + i * 0.31));
+                    target = 0.2f + 0.7f * a + (float) Math.random() * 0.1f;
+                }
+            }
+            float cur = waveLevels[i];
+            cur = target > cur ? target * 0.6f + cur * 0.4f : cur * 0.82f + target * 0.18f;
+            if (cur < 0.01f) cur = 0f;
+            if (cur > 0f) any = true;
+            waveLevels[i] = cur;
+        }
+        float head = 0.5f;
+        if (ctl != null && durMs > 0 && posMs >= 0) {
+            long cur = posMs + (isPlaying ? (long) ((SystemClock.elapsedRealtime() - posBase) * speed) : 0L);
+            head = Math.max(0f, Math.min(1f, cur / (float) durMs));
+        }
+        wave.head = head;
+        if (isPlaying || any) wave.invalidate();
+    }
+
+    void mediaAction() {
+        if (ctl == null) return;
+        try {
+            MediaController.TransportControls tc = ctl.getTransportControls();
+            if (mediaIdx == 0) tc.skipToPrevious();
+            else if (mediaIdx == 2) tc.skipToNext();
+            else if (isPlaying) tc.pause();
+            else tc.play();
+        } catch (Throwable t) { }
+        handler.postDelayed(new Runnable() { public void run() { pollMedia(); } }, 350);
+    }
+
+    // ---------- Reloj y red ----------
     String netName() {
         try {
             ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -536,6 +1229,7 @@ public class MainActivity extends Activity {
     }
 
     void updateClock() {
+        if (greeting == null) return;
         Date now = new Date();
         int hr = Integer.parseInt(new SimpleDateFormat("H", Locale.US).format(now));
         greeting.setText(hr < 12 ? "Buenos días" : (hr < 19 ? "Buenas tardes" : "Buenas noches"));
@@ -546,37 +1240,51 @@ public class MainActivity extends Activity {
         String net = netName();
         if (!net.equals(lastNet)) {
             lastNet = net;
-            pills[1].setText(net);
+            pills[2].setText(net);
             layoutPills();
             if (zone == TOP) updateFocus();
         }
     }
 
+    // ---------- Foco y navegacion ----------
     void updateFocus() {
         for (View v : dockViews) v.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
         for (View v : gridViews) v.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
         for (TextView l : gridLabels) l.setVisibility(View.INVISIBLE);
-        View target = null;
+        boolean has = false;
+        float cx = 0, cy = 0, bw = 0, bh = 0;
         float s = 1f;
         float pad = px(8);
         float big = moving ? 1.2f : 1.1f;
         if (moving) pad = px(14);
         if (zone == TOP) {
-            target = pills[topIdx];
-            pad = px(6);
+            FrameLayout.LayoutParams t = (FrameLayout.LayoutParams) pills[topIdx].getLayoutParams();
+            cx = t.leftMargin + t.width / 2f; cy = t.topMargin + t.height / 2f;
+            bw = t.width; bh = t.height; pad = px(6); has = true;
+        } else if (zone == MEDIA && hasMedia()) {
+            FrameLayout.LayoutParams wl = (FrameLayout.LayoutParams) mediaWidget.getLayoutParams();
+            FrameLayout.LayoutParams t = (FrameLayout.LayoutParams) ctlViews.get(mediaIdx).getLayoutParams();
+            cx = wl.leftMargin + t.leftMargin + t.width / 2f;
+            cy = wl.topMargin + t.topMargin + t.height / 2f;
+            bw = t.width; bh = t.height; pad = px(10); has = true;
         } else if (zone == DOCK && !dock.isEmpty()) {
-            target = dockViews.get(dockIdx);
-            s = big;
-        } else if (zone == GRID && !grid.isEmpty()) {
-            target = gridViews.get(gridIdx);
-            s = big;
-            gridLabels.get(gridIdx).setVisibility(View.VISIBLE);
-        }
-        if (target != null) {
-            if (s != 1f) target.animate().scaleX(s).scaleY(s).setDuration(120).start();
+            View target = dockViews.get(dockIdx);
             FrameLayout.LayoutParams t = (FrameLayout.LayoutParams) target.getLayoutParams();
-            float cx = t.leftMargin + t.width / 2f, cy = t.topMargin + t.height / 2f;
-            int w = Math.round(t.width * s + 2 * pad), h = Math.round(t.height * s + 2 * pad);
+            s = big;
+            target.animate().scaleX(s).scaleY(s).setDuration(120).start();
+            cx = t.leftMargin + t.width / 2f; cy = t.topMargin + t.height / 2f;
+            bw = t.width; bh = t.height; has = true;
+        } else if (zone == GRID && !grid.isEmpty()) {
+            View target = gridViews.get(gridIdx);
+            FrameLayout.LayoutParams t = (FrameLayout.LayoutParams) target.getLayoutParams();
+            s = big;
+            target.animate().scaleX(s).scaleY(s).setDuration(120).start();
+            gridLabels.get(gridIdx).setVisibility(View.VISIBLE);
+            cx = t.leftMargin + t.width / 2f; cy = t.topMargin + t.height / 2f;
+            bw = t.width; bh = t.height; has = true;
+        }
+        if (has) {
+            int w = Math.round(bw * s + 2 * pad), h = Math.round(bh * s + 2 * pad);
             FrameLayout.LayoutParams g = (FrameLayout.LayoutParams) glass.getLayoutParams();
             g.width = w;
             g.height = h;
@@ -612,14 +1320,22 @@ public class MainActivity extends Activity {
 
     void move(int dx, int dy) {
         if (zone == TOP) {
-            if (dx != 0) topIdx = clampi(topIdx + dx, 0, 2);
+            if (dx != 0) topIdx = clampi(topIdx + dx, 0, PILLS - 1);
+            else if (dy > 0) {
+                if (hasMedia()) zone = MEDIA;
+                else if (!dock.isEmpty()) zone = DOCK;
+                else if (!grid.isEmpty()) { zone = GRID; gridIdx = 0; }
+            }
+        } else if (zone == MEDIA) {
+            if (dx != 0) mediaIdx = clampi(mediaIdx + dx, 0, 2);
+            else if (dy < 0) zone = TOP;
             else if (dy > 0) {
                 if (!dock.isEmpty()) zone = DOCK;
                 else if (!grid.isEmpty()) { zone = GRID; gridIdx = 0; }
             }
         } else if (zone == DOCK) {
             if (dx != 0) dockIdx = clampi(dockIdx + dx, 0, dock.size() - 1);
-            else if (dy < 0) zone = TOP;
+            else if (dy < 0) zone = hasMedia() ? MEDIA : TOP;
             else if (dy > 0 && !grid.isEmpty()) {
                 zone = GRID;
                 gridIdx = Math.min(dockIdx, grid.size() - 1);
@@ -639,19 +1355,20 @@ public class MainActivity extends Activity {
             } else if (dy < 0) {
                 if (r == 0) {
                     if (!dock.isEmpty()) { zone = DOCK; dockIdx = Math.min(c, dock.size() - 1); }
-                    else zone = TOP;
+                    else zone = hasMedia() ? MEDIA : TOP;
                 } else gridIdx -= 4;
             }
         }
         updateFocus();
     }
 
+    // ---------- Mover / dock / ocultar / desinstalar ----------
     void startMove() {
-        if (zone == TOP || menuOpen) return;
+        if (zone == TOP || zone == MEDIA || menuOpen) return;
         if (zone == DOCK && dock.isEmpty()) return;
         if (zone == GRID && grid.isEmpty()) return;
         moving = true;
-        Toast.makeText(this, "Mover: usa las flechas. Pulsa OK para soltar", Toast.LENGTH_LONG).show();
+        Toast.makeText(this, "Mover: usa las flechas. OK para soltar", Toast.LENGTH_SHORT).show();
         updateFocus();
     }
 
@@ -728,6 +1445,15 @@ public class MainActivity extends Activity {
     void uninstallApp() {
         App a = (zone == DOCK) ? dock.get(dockIdx) : grid.get(gridIdx);
         try {
+            ApplicationInfo ai = getPackageManager().getApplicationInfo(a.pkg, 0);
+            boolean sys = (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0
+                    && (ai.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0;
+            if (sys) {
+                Toast.makeText(this, a.label + " es del sistema: no se puede desinstalar", Toast.LENGTH_LONG).show();
+                return;
+            }
+        } catch (Throwable t) { }
+        try {
             Intent intent = new Intent(Intent.ACTION_DELETE);
             intent.setData(Uri.parse("package:" + a.pkg));
             startActivity(intent);
@@ -744,7 +1470,7 @@ public class MainActivity extends Activity {
     }
 
     void openContextMenu() {
-        if (zone == TOP || menuOpen || moving) return;
+        if (zone == TOP || zone == MEDIA || menuOpen || moving) return;
         entries.clear();
         if (zone == DOCK) {
             if (dock.isEmpty()) return;
@@ -754,23 +1480,29 @@ public class MainActivity extends Activity {
         } else {
             if (grid.isEmpty()) return;
             addEntry("Mover", new Runnable() { public void run() { startMove(); } });
-            addEntry(dock.size() < 4 ? "Agregar al dock" : "Agregar al dock (cambia la última)",
+            addEntry(dock.size() < 4 ? "Agregar al dock" : "Agregar al dock (reemplaza última)",
                     new Runnable() { public void run() { addToDock(); } });
             addEntry("Ocultar", new Runnable() { public void run() { hideApp(); } });
             addEntry("Desinstalar app", new Runnable() { public void run() { uninstallApp(); } });
         }
         if (hiddenInstalled > 0) {
-            addEntry("Mostrar apps ocultas (" + hiddenInstalled + ")",
+            addEntry("Mostrar ocultas (" + hiddenInstalled + ")",
                     new Runnable() { public void run() { showHidden(); } });
         }
-        showPanel(true);
+        addEntry("Cambiar fondo", new Runnable() {
+            public void run() { handler.post(new Runnable() { public void run() { openWallpaperMenu(); } }); }
+        });
+        showPanel(true, 520, 0);
     }
 
     void activate() {
         if (zone == TOP) {
-            if (topIdx == 0) openMenu();
-            else if (topIdx == 1) openSettings(Settings.ACTION_WIFI_SETTINGS);
+            if (topIdx == 0) openWallpaperMenu();
+            else if (topIdx == 1) openMenu();
+            else if (topIdx == 2) openSettings(Settings.ACTION_WIFI_SETTINGS);
             else openSettings(Settings.ACTION_SETTINGS);
+        } else if (zone == MEDIA) {
+            mediaAction();
         } else {
             App a = zone == DOCK ? dock.get(dockIdx) : grid.get(gridIdx);
             try { startActivity(a.launch); }
@@ -811,43 +1543,57 @@ public class MainActivity extends Activity {
         } catch (Throwable t) { }
         if (entries.isEmpty()) {
             Entry e = new Entry();
-            e.label = "Sin entradas";
+            e.label = "Sin entradas TV";
             entries.add(e);
         }
-        showPanel(false);
+        showPanel(false, 380, 0);
     }
 
-    void showPanel(boolean centered) {
-        int rowH = px(64), w = px(centered ? 460 : 380);
+    // ---------- Panel flotante (con scroll) ----------
+    void showPanel(boolean centered, int wUnits, int initial) {
+        int rowH = px(64), w = px(wUnits);
+        menuVis = Math.min(entries.size(), 9);
         FrameLayout panel = new FrameLayout(this);
-        panel.setBackground(rounded(0xF0242428, px(28)));
+        panel.setBackground(glassFill(px(28), 0xEE2A2A30, 0xEE17171B, 0x55FFFFFF));
         menuRows.clear();
         for (int i = 0; i < entries.size(); i++) {
-            TextView r = text(px(28), Color.WHITE, "sans-serif");
+            TextView r = text(px(28), Color.WHITE);
             r.setText(entries.get(i).label);
             r.setGravity(Gravity.CENTER_VERTICAL);
             r.setPadding(px(28), 0, px(16), 0);
-            panel.addView(r, lp(w - px(24), rowH, px(12), px(12) + i * rowH));
+            panel.addView(r, lp(w - px(24), rowH, px(12), px(12)));
             menuRows.add(r);
         }
-        int h = entries.size() * rowH + px(24);
+        int h = menuVis * rowH + px(24);
         if (centered) {
             root.addView(panel, lp(w, h, (W - w) / 2, (H - h) / 2));
         } else {
-            FrameLayout.LayoutParams pl = (FrameLayout.LayoutParams) pills[0].getLayoutParams();
+            FrameLayout.LayoutParams pl = (FrameLayout.LayoutParams) pills[1].getLayoutParams();
             int x = Math.min(pl.leftMargin, W - px(40) - w);
             int y = pl.topMargin + pl.height + px(14);
             page.addView(panel, lp(w, h, x, y));
         }
         menuPanel = panel;
-        menuIdx = 0;
+        menuIdx = clampi(initial, 0, Math.max(0, entries.size() - 1));
+        menuStart = 0;
         menuOpen = true;
         paintMenu();
     }
 
     void paintMenu() {
+        if (menuIdx < menuStart) menuStart = menuIdx;
+        if (menuIdx >= menuStart + menuVis) menuStart = menuIdx - menuVis + 1;
+        int rowH = px(64);
         for (int i = 0; i < menuRows.size(); i++) {
-            menuRows.get(i).setBackground(i == menuIdx ? rounded(0x44FFFFFF, px(18)) : null);
+            TextView r = menuRows.get(i);
+            boolean vis = i >= menuStart && i < menuStart + menuVis;
+            r.setVisibility(vis ? View.VISIBLE : View.GONE);
+            if (vis) {
+                FrameLayout.LayoutParams l = (FrameLayout.LayoutParams) r.getLayoutParams();
+                l.topMargin = px(12) + (i - menuStart) * rowH;
+                r.setLayoutParams(l);
+            }
+            r.setBackground(i == menuIdx ? rounded(0x55FFFFFF, px(18)) : null);
         }
     }
 
@@ -866,6 +1612,7 @@ public class MainActivity extends Activity {
     }
 
     void menuSelect() {
+        if (entries.isEmpty()) return;
         Entry e = entries.get(menuIdx);
         closeMenu();
         if (e.action != null) { e.action.run(); return; }
@@ -877,6 +1624,7 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------- Control remoto ----------
     @Override public boolean dispatchKeyEvent(KeyEvent e) {
         int k = e.getKeyCode();
         boolean center = k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER
@@ -891,7 +1639,7 @@ public class MainActivity extends Activity {
                 if (e.getRepeatCount() == 0) {
                     centerDown = true;
                     longFired = false;
-                    if (!menuOpen && !moving && zone != TOP) handler.postDelayed(longPress, 600);
+                    if (!menuOpen && !moving && zone != TOP && zone != MEDIA) handler.postDelayed(longPress, 500);
                 }
             } else if (act == KeyEvent.ACTION_UP) {
                 handler.removeCallbacks(longPress);
