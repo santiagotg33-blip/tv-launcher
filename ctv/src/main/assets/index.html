@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CTV</title>
+<style>
+body{margin:0;background:#0b0b0d;color:#f2f2f7;font-family:system-ui,-apple-system,Roboto,sans-serif}
+.w{max-width:720px;margin:0 auto;padding:20px 16px 60px}
+h1{display:flex;align-items:center;gap:12px;font-size:30px;margin:8px 0 4px}
+.sub{color:#9a9aa0;margin:0 0 14px}
+.card{background:#1c1c1e;border-radius:18px;padding:18px;margin:14px 0}
+.card h2{font-size:17px;margin:0 0 12px}
+.btn{display:inline-block;background:#0a84ff;color:#fff;border:0;border-radius:12px;padding:13px 18px;font-size:16px;font-weight:600;cursor:pointer;text-decoration:none}
+.btn.g{background:#3a3a3c}
+.btn.r{background:#c0392b}
+input[type=text]{width:100%;box-sizing:border-box;background:#0b0b0d;border:1px solid #3a3a3c;border-radius:12px;color:#fff;padding:13px;font-size:16px;margin-bottom:10px}
+.f{display:flex;align-items:center;gap:8px;padding:10px 0;border-top:1px solid #2c2c2e;flex-wrap:wrap}
+.n{flex:1;min-width:160px;word-break:break-all}
+.n small{color:#9a9aa0}
+#msg,.j{color:#9a9aa0;margin-top:10px;font-size:14px}
+</style>
+</head>
+<body>
+<div class="w">
+<h1><svg width="40" height="40" viewBox="0 0 24 24"><path fill="#ffffff" d="M22 2L2 10l7 3z"/><path fill="#cfe3ff" d="M22 2L9 13l3 8z"/><path fill="#8dbbff" d="M9 13l3 8 1.5-4.5z"/></svg> CTV</h1>
+<p class="sub">Envía y recibe archivos y aplicaciones del TV. Espacio libre en el TV: {{FREE}}</p>
+
+<div class="card">
+<h2>Enviar al TV</h2>
+<label class="btn" for="fi">Elegir archivos</label>
+<input id="fi" type="file" multiple hidden onchange="send(this.files)">
+<div id="msg">También puedes arrastrar archivos a esta página.</div>
+</div>
+
+<div class="card">
+<h2>Descargar en el TV desde un enlace de Internet</h2>
+<input id="url" type="text" placeholder="https://ejemplo.com/archivo.apk">
+<button class="btn" onclick="getUrl()">Descargar en el TV</button>
+<div id="jobs"></div>
+</div>
+
+<div class="card">
+<h2>Archivos en el TV</h2>
+<div id="files">{{FILES}}</div>
+<div style="margin-top:12px"><button class="btn g" onclick="location.reload()">Actualizar lista</button></div>
+</div>
+</div>
+<script>
+var K='{{TOKEN}}';
+function $(i){return document.getElementById(i);}
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function send(files){
+  var i=0;
+  (function next(){
+    if(i>=files.length){location.reload();return;}
+    var f=files[i++];
+    var x=new XMLHttpRequest();
+    x.open('POST','/upload?k='+K+'&name='+encodeURIComponent(f.name));
+    x.upload.onprogress=function(e){
+      if(e.lengthComputable){$('msg').textContent='Enviando '+f.name+' ('+i+'/'+files.length+') '+Math.round(e.loaded*100/e.total)+'%';}
+    };
+    x.onload=function(){
+      if(x.status!=200){$('msg').textContent='Error con '+f.name+': '+x.responseText;setTimeout(next,1800);}
+      else{next();}
+    };
+    x.onerror=function(){$('msg').textContent='Se perdió la conexión con el TV';};
+    x.send(f);
+  })();
+}
+function getUrl(){
+  var u=$('url').value.trim();
+  if(!u){return;}
+  var x=new XMLHttpRequest();
+  x.open('POST','/fetch?k='+K+'&url='+encodeURIComponent(u));
+  x.onload=function(){if(x.status!=200){$('jobs').innerHTML='<div class="j">'+esc(x.responseText)+'</div>';}else{$('url').value='';poll();}};
+  x.send();
+}
+function del(n){
+  if(!confirm('¿Eliminar este archivo del TV?')){return;}
+  var x=new XMLHttpRequest();
+  x.open('POST','/delete?k='+K+'&name='+n);
+  x.onload=function(){location.reload();};
+  x.send();
+}
+function poll(){
+  var x=new XMLHttpRequest();
+  x.open('GET','/status?k='+K);
+  x.onload=function(){
+    try{
+      var a=JSON.parse(x.responseText),h='';
+      for(var i=0;i<a.length;i++){
+        var j=a[i],p=j.t>0?Math.round(j.d*100/j.t)+'%':'';
+        h+='<div class="j">'+esc(j.n||'...')+' — '+esc(j.s)+' '+p+'</div>';
+      }
+      $('jobs').innerHTML=h;
+    }catch(e){}
+  };
+  x.send();
+}
+document.body.ondragover=function(e){e.preventDefault();};
+document.body.ondrop=function(e){e.preventDefault();send(e.dataTransfer.files);};
+setInterval(poll,1500);poll();
+</script>
+</body>
+</html>

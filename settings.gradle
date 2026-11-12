@@ -3,3 +3,4 @@ dependencyResolutionManagement { repositories { google(); mavenCentral() } }
 rootProject.name = "tv-launcher"
 include ':app'
 include ':remote'
+include ':ctv'
