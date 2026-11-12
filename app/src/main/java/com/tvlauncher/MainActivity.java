@@ -12,8 +12,13 @@ import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.content.res.Resources;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.ColorMatrixColorFilter;
+import android.graphics.LinearGradient;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffColorFilter;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Matrix;
@@ -25,6 +30,7 @@ import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.SurfaceTexture;
 import android.graphics.Typeface;
+import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.media.MediaMetadata;
@@ -62,6 +68,12 @@ import android.widget.ImageView;
 import android.widget.TextView;
 import android.widget.Toast;
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.HashMap;
+import org.xmlpull.v1.XmlPullParser;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -75,10 +87,10 @@ import java.util.Locale;
 
 public class MainActivity extends Activity {
     static final int TOP = 0, DOCK = 1, GRID = 2, MEDIA = 3;
-    static final int PILLS = 4;      // Fondos, Entradas, Red, Configuracion
+    static final int PILLS = 5;      // Fondos, Iconos, Entradas, Red, Configuracion
     static final int WAVE_N = 56;    // columnas de la onda
 
-    static class App { String pkg, label; Drawable img; boolean banner; Intent launch; int glow; }
+    static class App { String pkg, label, cname; Drawable img; boolean banner; Intent launch; int glow; }
     static class Entry { String label; Intent intent; Intent fallback; Runnable action; }
 
     // ---------- Vista: fondo animado tipo aurora ----------
@@ -266,6 +278,14 @@ public class MainActivity extends Activity {
     long posMs = -1, posBase = 0, durMs = -1;
     float speed = 1f;
     String lastArtKey = "";
+    boolean mediaShown = false, warned = false;
+    long lastPlayMs = 0, lastFixMs = 0;
+    String artUriFor = "";
+    volatile Bitmap uriArt = null;
+    volatile String uriLoading = "";
+    String packLoaded = "";
+    HashMap<String, String> packMap = null;
+    Resources packRes = null;
 
     // Fondo
     AuroraView aurora;
@@ -486,8 +506,11 @@ public class MainActivity extends Activity {
                 if (bn == null) {
                     try { bn = ri.activityInfo.applicationInfo.loadBanner(pm); } catch (Throwable t) { }
                 }
+                Drawable ic = ri.loadIcon(pm);
+                a.cname = pkg + "/" + ri.activityInfo.name;
                 if (bn != null) { a.img = bn; a.banner = true; }
-                else { a.img = ri.loadIcon(pm); a.banner = false; }
+                else { a.img = ic; a.banner = false; }
+                customIcon(a, ic, bn != null);
                 Intent l = new Intent(Intent.ACTION_MAIN);
                 l.addCategory(cat);
                 l.setClassName(pkg, ri.activityInfo.name);
@@ -524,7 +547,7 @@ public class MainActivity extends Activity {
         grid.addAll(og);
     }
 
-    boolean hasMedia() { return ctl != null && !ctlViews.isEmpty(); }
+    boolean hasMedia() { return ctl != null && mediaShown && !ctlViews.isEmpty(); }
 
     void clampState() {
         if (zone == MEDIA && !hasMedia()) zone = dock.isEmpty() ? (grid.isEmpty() ? TOP : GRID) : DOCK;
@@ -612,7 +635,7 @@ public class MainActivity extends Activity {
         date = text(px(32), 0x99FFFFFF);
         page.addView(date, lp(W / 2, px(44), px(80), px(232)));
 
-        String[] pt = { "Fondos", "Entradas", "Wi-Fi", "Configuración" };
+        String[] pt = { "Fondos", "Iconos", "Entradas", "Wi-Fi", "Configuración" };
         for (int i = 0; i < PILLS; i++) {
             TextView p = text(px(26), Color.WHITE);
             p.setText(pt[i]);
@@ -724,6 +747,9 @@ public class MainActivity extends Activity {
         }
 
         page.addView(mediaWidget, lp(mw, mh, (W - mw) / 2, px(290)));
+        mediaWidget.setAlpha(0f);
+        mediaWidget.setVisibility(View.INVISIBLE);
+        mediaShown = false;
         applyTrackTexts("", "Sin reproducción", "Abre Spotify o Kodi", "");
     }
 
@@ -1010,6 +1036,391 @@ public class MainActivity extends Activity {
         showPanel(true, 760, wpCur);
     }
 
+    // ---------- Acceso a la musica (Spotify / Kodi) ----------
+    boolean enableListener() {
+        try {
+            String cn = listenerCn.flattenToString();
+            String cur = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
+            if (cur == null) cur = "";
+            if (!cur.contains(cn)) {
+                Settings.Secure.putString(getContentResolver(), "enabled_notification_listeners",
+                        cur.length() == 0 ? cn : cur + ":" + cn);
+            }
+            if (Build.VERSION.SDK_INT >= 24) {
+                android.service.notification.NotificationListenerService.requestRebind(listenerCn);
+            }
+            return true;
+        } catch (Throwable t) { return false; }
+    }
+
+    /** Intenta activar solo el permiso; si no se puede, avisa una vez como hacerlo. */
+    void fixListener(boolean manual) {
+        long now = SystemClock.elapsedRealtime();
+        if (!manual && now - lastFixMs < 30000) return;
+        lastFixMs = now;
+        if (enableListener()) {
+            if (manual) Toast.makeText(this, "Listo. Reproduce algo en Spotify.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (manual) {
+            try { startActivity(new Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")); return; }
+            catch (Throwable t) { }
+        }
+        if (manual || !warned) {
+            warned = true;
+            Toast.makeText(this, "Falta un permiso: ejecuta dar_permisos.sh desde Termux (una sola vez)",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /** Caratula por URL (Spotify a veces la manda como enlace y no como imagen). */
+    Bitmap uriBitmap(final String uri) {
+        if (uri.equals(artUriFor) && uriArt != null) return uriArt;
+        if (!uri.equals(uriLoading) && !uri.equals(artUriFor)) {
+            uriLoading = uri;
+            new Thread(new Runnable() {
+                public void run() {
+                    Bitmap b = null;
+                    try {
+                        InputStream in;
+                        if (uri.startsWith("http")) {
+                            HttpURLConnection c = (HttpURLConnection) new URL(uri).openConnection();
+                            c.setConnectTimeout(6000);
+                            c.setReadTimeout(8000);
+                            in = c.getInputStream();
+                        } else {
+                            in = getContentResolver().openInputStream(Uri.parse(uri));
+                        }
+                        b = BitmapFactory.decodeStream(in);
+                        in.close();
+                    } catch (Throwable t) { }
+                    if (b != null) { uriArt = b; artUriFor = uri; }
+                    else { uriArt = null; artUriFor = uri; }
+                    uriLoading = "";
+                }
+            }).start();
+        }
+        return null;
+    }
+
+    // ---------- Iconos personalizados ----------
+    static final String[] STYLE_NAMES = { "Original", "Pack Glass", "Pack Color", "Pack Neón", "Pack Claro", "Pack Mono" };
+
+    File iconDir() {
+        File d = new File(getFilesDir(), "icons");
+        d.mkdirs();
+        return d;
+    }
+
+    void customIcon(App a, Drawable ic, boolean hadBanner) {
+        try {
+            String per = prefs.getString("ic_" + a.pkg, "");
+            if (per.equals("file")) {
+                File f = new File(iconDir(), a.pkg + ".png");
+                Bitmap b = f.exists() ? BitmapFactory.decodeFile(f.getAbsolutePath()) : null;
+                if (b != null) { a.img = new BitmapDrawable(getResources(), b); a.banner = true; return; }
+            }
+            if (per.equals("orig")) return;
+            int style = prefs.getInt("icon_style", 0);
+            boolean perStyle = per.startsWith("style:");
+            if (perStyle) style = Integer.parseInt(per.substring(6));
+            boolean force = prefs.getBoolean("icon_force", false);
+            if (hadBanner && !force && !perStyle) return;
+            Drawable pk = packIcon(a);
+            if (pk != null) ic = pk;
+            if (ic == null) return;
+            if (style > 0) {
+                a.img = new BitmapDrawable(getResources(), styled(ic, style));
+                a.banner = true;
+            } else if (pk != null || hadBanner) {
+                a.img = ic;
+                a.banner = false;
+            }
+        } catch (Throwable t) { }
+    }
+
+    /** Dibuja un icono sobre una base 16:9 con el estilo elegido. */
+    Bitmap styled(Drawable ic, int style) {
+        int w = 320, h = 180;
+        Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(out);
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        int col = avgColor(ic);
+        float[] hsv = new float[3];
+        Color.colorToHSV(col, hsv);
+        hsv[2] *= 0.55f;
+        int dark = Color.HSVToColor(hsv);
+        if (style == 1) {
+            p.setShader(new LinearGradient(0, 0, 0, h, 0xFF3C3C46, 0xFF1B1B21, Shader.TileMode.CLAMP));
+            c.drawRect(0, 0, w, h, p);
+            p.setShader(null);
+            p.setColor(0x1CFFFFFF);
+            c.drawRect(0, 0, w, h / 2f, p);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(5);
+            p.setColor(0x66FFFFFF);
+            c.drawRect(2, 2, w - 2, h - 2, p);
+        } else if (style == 2) {
+            p.setShader(new LinearGradient(0, 0, w, h, col, dark, Shader.TileMode.CLAMP));
+            c.drawRect(0, 0, w, h, p);
+        } else if (style == 3) {
+            c.drawColor(0xFF0A0A12);
+            p.setShader(new RadialGradient(w / 2f, h / 2f, w * 0.5f,
+                    new int[] { (col & 0x00FFFFFF) | 0x77000000, col & 0x00FFFFFF },
+                    new float[] { 0f, 1f }, Shader.TileMode.CLAMP));
+            c.drawRect(0, 0, w, h, p);
+            p.setShader(null);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(8);
+            p.setColor(col);
+            c.drawRect(4, 4, w - 4, h - 4, p);
+        } else if (style == 4) {
+            p.setShader(new LinearGradient(0, 0, 0, h, 0xFFFFFFFF, 0xFFD5D9E2, Shader.TileMode.CLAMP));
+            c.drawRect(0, 0, w, h, p);
+        } else {
+            p.setShader(new LinearGradient(0, 0, w, h, 0xFF2D3340, 0xFF12141A, Shader.TileMode.CLAMP));
+            c.drawRect(0, 0, w, h, p);
+        }
+        int size = Math.round(h * 0.62f);
+        Drawable d = ic;
+        Drawable.ConstantState cs = ic.getConstantState();
+        if (cs != null) d = cs.newDrawable().mutate();
+        Bitmap tmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+        d.setBounds(0, 0, size, size);
+        d.draw(new Canvas(tmp));
+        int left = (w - size) / 2, top = (h - size) / 2;
+        if (style != 4 && style != 5) {
+            Paint sp = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+            sp.setColorFilter(new PorterDuffColorFilter(0x66000000, PorterDuff.Mode.SRC_IN));
+            c.drawBitmap(tmp, left + 3, top + 6, sp);
+        }
+        Paint ip = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        if (style == 5) {
+            ip.setColorFilter(new ColorMatrixColorFilter(new float[] {
+                    0, 0, 0, 0, 255,  0, 0, 0, 0, 255,  0, 0, 0, 0, 255,  0, 0, 0, 1, 0 }));
+        }
+        c.drawBitmap(tmp, left, top, ip);
+        tmp.recycle();
+        return out;
+    }
+
+    // Packs de iconos instalados (formato ADW / Nova / Apex / Go)
+    List<String[]> findPacks() {
+        List<String[]> res = new ArrayList<String[]>();
+        HashSet<String> seen = new HashSet<String>();
+        PackageManager pm = getPackageManager();
+        String[] acts = { "org.adw.launcher.THEMES", "com.novalauncher.THEME", "com.anddoes.launcher.THEME",
+                "com.gau.go.launcherex.theme" };
+        for (String act : acts) {
+            try {
+                for (ResolveInfo ri : pm.queryIntentActivities(new Intent(act), 0)) {
+                    String pk = ri.activityInfo.packageName;
+                    if (seen.add(pk)) res.add(new String[] { pk, String.valueOf(ri.loadLabel(pm)) });
+                }
+            } catch (Throwable t) { }
+        }
+        return res;
+    }
+
+    void loadPack(String pk) {
+        packLoaded = pk;
+        packMap = new HashMap<String, String>();
+        packRes = null;
+        try {
+            packRes = getPackageManager().getResourcesForApplication(pk);
+            XmlPullParser xp;
+            int id = packRes.getIdentifier("appfilter", "xml", pk);
+            if (id != 0) {
+                xp = packRes.getXml(id);
+            } else {
+                xp = org.xmlpull.v1.XmlPullParserFactory.newInstance().newPullParser();
+                xp.setInput(packRes.getAssets().open("appfilter.xml"), "utf-8");
+            }
+            int ev = xp.getEventType();
+            while (ev != XmlPullParser.END_DOCUMENT) {
+                if (ev == XmlPullParser.START_TAG && "item".equals(xp.getName())) {
+                    String comp = xp.getAttributeValue(null, "component");
+                    String dr = xp.getAttributeValue(null, "drawable");
+                    if (comp != null && dr != null) {
+                        int s = comp.indexOf('{'), e = comp.indexOf('}');
+                        if (s >= 0 && e > s) {
+                            String cn = comp.substring(s + 1, e);
+                            int sl = cn.indexOf('/');
+                            if (sl > 0) {
+                                String pp = cn.substring(0, sl), cls = cn.substring(sl + 1);
+                                if (cls.startsWith(".")) cn = pp + "/" + pp + cls;
+                                if (!packMap.containsKey(pp)) packMap.put(pp, dr);
+                            }
+                            if (!packMap.containsKey(cn)) packMap.put(cn, dr);
+                        }
+                    }
+                }
+                ev = xp.next();
+            }
+        } catch (Throwable t) { }
+    }
+
+    Drawable packIcon(App a) {
+        String pk = prefs.getString("icon_pack", "");
+        if (pk.length() == 0) return null;
+        if (!pk.equals(packLoaded)) loadPack(pk);
+        if (packRes == null || packMap == null) return null;
+        String dn = packMap.get(a.cname);
+        if (dn == null) dn = packMap.get(a.pkg);
+        if (dn == null) return null;
+        try {
+            int id = packRes.getIdentifier(dn, "drawable", pk);
+            if (id == 0) id = packRes.getIdentifier(dn, "mipmap", pk);
+            if (id != 0) return packRes.getDrawable(id);
+        } catch (Throwable t) { }
+        return null;
+    }
+
+    void reloadUi() {
+        handler.post(rebuild);
+    }
+
+    void setPerApp(String pkg, String val) {
+        File f = new File(iconDir(), pkg + ".png");
+        if (!val.equals("file") && f.exists()) f.delete();
+        if (val.length() == 0) prefs.edit().remove("ic_" + pkg).apply();
+        else prefs.edit().putString("ic_" + pkg, val).apply();
+        reloadUi();
+    }
+
+    /** Apartado "Iconos": estilo general, packs instalados y restablecer. */
+    void openIconMenu() {
+        if (menuOpen || moving) return;
+        entries.clear();
+        final int st = prefs.getInt("icon_style", 0);
+        final String pk = prefs.getString("icon_pack", "");
+        for (int i = 0; i < STYLE_NAMES.length; i++) {
+            final int s = i;
+            addEntry((st == i ? "• " : "   ") + (i == 0 ? "Iconos originales" : STYLE_NAMES[i]), new Runnable() {
+                public void run() { prefs.edit().putInt("icon_style", s).apply(); reloadUi(); }
+            });
+        }
+        final boolean force = prefs.getBoolean("icon_force", false);
+        addEntry("   Apps con banner: " + (force ? "usar icono con estilo" : "mantener banner") + "  (cambiar)",
+                new Runnable() {
+            public void run() { prefs.edit().putBoolean("icon_force", !force).apply(); reloadUi(); }
+        });
+        List<String[]> packs = findPacks();
+        for (final String[] p : packs) {
+            addEntry((pk.equals(p[0]) ? "• " : "   ") + "Pack instalado: " + p[1], new Runnable() {
+                public void run() { packLoaded = ""; prefs.edit().putString("icon_pack", p[0]).apply(); reloadUi(); }
+            });
+        }
+        if (packs.isEmpty()) {
+            addEntry("   (Instala un pack de iconos de Play Store y aparecerá aquí)", null);
+        }
+        if (pk.length() > 0) {
+            addEntry("   Quitar pack instalado", new Runnable() {
+                public void run() { packLoaded = ""; prefs.edit().remove("icon_pack").apply(); reloadUi(); }
+            });
+        }
+        addEntry("   Restablecer iconos de todas las apps", new Runnable() {
+            public void run() {
+                SharedPreferences.Editor ed = prefs.edit();
+                for (String k : new ArrayList<String>(prefs.getAll().keySet())) {
+                    if (k.startsWith("ic_")) ed.remove(k);
+                }
+                ed.remove("icon_style").remove("icon_pack").remove("icon_force").apply();
+                File[] fs = iconDir().listFiles();
+                if (fs != null) for (File f : fs) f.delete();
+                packLoaded = "";
+                reloadUi();
+            }
+        });
+        showPanel(true, 760, st);
+    }
+
+    /** Menu "Cambiar icono" de una app concreta. */
+    void openAppIconMenu(final App a) {
+        if (menuOpen || moving) return;
+        entries.clear();
+        final String cur = prefs.getString("ic_" + a.pkg, "");
+        addEntry((cur.equals("orig") ? "• " : "   ") + "Original (sin cambios)", new Runnable() {
+            public void run() { setPerApp(a.pkg, "orig"); }
+        });
+        for (int i = 1; i < STYLE_NAMES.length; i++) {
+            final int s = i;
+            addEntry((cur.equals("style:" + i) ? "• " : "   ") + STYLE_NAMES[i], new Runnable() {
+                public void run() { setPerApp(a.pkg, "style:" + s); }
+            });
+        }
+        addEntry((cur.equals("file") ? "• " : "   ") + "Elegir imagen de mi galería…", new Runnable() {
+            public void run() { handler.post(new Runnable() { public void run() { openIconGallery(a); } }); }
+        });
+        addEntry("   Usar el estilo general", new Runnable() {
+            public void run() { setPerApp(a.pkg, ""); }
+        });
+        showPanel(true, 640, 0);
+    }
+
+    void openIconGallery(final App a) {
+        if (menuOpen || moving) return;
+        entries.clear();
+        if (hasStorage()) {
+            List<String[]> files = new ArrayList<String[]>();
+            HashSet<String> seen = new HashSet<String>();
+            File ext = Environment.getExternalStorageDirectory();
+            String[] roots = { "Icons", "Iconos", "Pictures", "Download", "DCIM" };
+            for (String r : roots) scanFiles(new File(ext, r), 0, files, seen);
+            for (final String[] f : files) {
+                if (!"image".equals(f[0])) continue;
+                addEntry("   " + f[2], new Runnable() {
+                    public void run() { importIcon(a, f[1]); }
+                });
+            }
+            if (entries.isEmpty()) {
+                addEntry("   (Pon tus imágenes en la carpeta Download o Pictures)", null);
+            }
+        } else {
+            addEntry("Permitir acceso a mis imágenes", new Runnable() {
+                public void run() { requestStorage(); }
+            });
+        }
+        showPanel(true, 760, 0);
+    }
+
+    void importIcon(App a, String path) {
+        try {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(path, o);
+            int ss = 1;
+            while (o.outWidth / ss > 1024 || o.outHeight / ss > 1024) ss *= 2;
+            o = new BitmapFactory.Options();
+            o.inSampleSize = ss;
+            Bitmap src = BitmapFactory.decodeFile(path, o);
+            if (src == null) throw new RuntimeException("x");
+            int w = 320, h = 180;
+            Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            Canvas c = new Canvas(out);
+            Paint p = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+            float ar = src.getWidth() / (float) src.getHeight();
+            if (ar >= 1.5f) {
+                // Panoramica: llena el cuadro
+                float sc = Math.max(w / (float) src.getWidth(), h / (float) src.getHeight());
+                float dw = src.getWidth() * sc, dh = src.getHeight() * sc;
+                c.drawBitmap(src, null, new RectF((w - dw) / 2f, (h - dh) / 2f, (w + dw) / 2f, (h + dh) / 2f), p);
+            } else {
+                // Cuadrada o vertical: se centra sobre fondo oscuro
+                c.drawColor(0xFF16161A);
+                float sc = h / (float) src.getHeight() * 0.9f;
+                float dw = src.getWidth() * sc, dh = src.getHeight() * sc;
+                c.drawBitmap(src, null, new RectF((w - dw) / 2f, (h - dh) / 2f, (w + dw) / 2f, (h + dh) / 2f), p);
+            }
+            FileOutputStream fo = new FileOutputStream(new File(iconDir(), a.pkg + ".png"));
+            out.compress(Bitmap.CompressFormat.PNG, 100, fo);
+            fo.close();
+            setPerApp(a.pkg, "file");
+        } catch (Throwable t) {
+            Toast.makeText(this, "No se pudo usar esa imagen", Toast.LENGTH_SHORT).show();
+        }
+    }
+
     // ---------- Widget multimedia ----------
     void applyTrackTexts(String album, String title, String artist, String app) {
         if (trackTitle == null) return;
@@ -1039,10 +1450,15 @@ public class MainActivity extends Activity {
                 }
             } catch (SecurityException e) {
                 listenerMissing = true;
+                fixListener(false);
             } catch (Throwable t) { }
         }
         ctl = best;
         isPlaying = playing;
+        long nowMs = SystemClock.elapsedRealtime();
+        if (playing) lastPlayMs = nowMs;
+        // El cuadro solo aparece al sonar (si pausas, se queda 20 s y se oculta)
+        boolean show = best != null && (playing || (lastPlayMs > 0 && nowMs - lastPlayMs < 20000));
 
         String album = "", title, artist, app = "";
         Bitmap art = null;
@@ -1063,12 +1479,20 @@ public class MainActivity extends Activity {
                     String a = m.getString(MediaMetadata.METADATA_KEY_ARTIST);
                     if (a == null || a.length() == 0) a = m.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST);
                     String al = m.getString(MediaMetadata.METADATA_KEY_ALBUM);
+                    if (t == null || t.length() == 0) t = m.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE);
+                    if (a == null || a.length() == 0) a = m.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE);
                     if (t != null && t.length() > 0) title = t;
                     if (a != null) artist = a;
                     if (al != null) album = al;
                     art = m.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
                     if (art == null) art = m.getBitmap(MediaMetadata.METADATA_KEY_ART);
                     if (art == null) art = m.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON);
+                    if (art == null) {
+                        String uri = m.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI);
+                        if (uri == null) uri = m.getString(MediaMetadata.METADATA_KEY_ART_URI);
+                        if (uri == null) uri = m.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI);
+                        if (uri != null) art = uriBitmap(uri);
+                    }
                     durMs = m.getLong(MediaMetadata.METADATA_KEY_DURATION);
                 }
                 PlaybackState s = best.getPlaybackState();
@@ -1092,6 +1516,18 @@ public class MainActivity extends Activity {
         }
         applyTrackTexts(album, title, artist, app);
 
+        if (show != mediaShown) {
+            mediaShown = show;
+            if (show) {
+                mediaWidget.setVisibility(View.VISIBLE);
+                mediaWidget.animate().alpha(1f).setDuration(350).start();
+            } else {
+                mediaWidget.animate().alpha(0f).setDuration(350).withEndAction(new Runnable() {
+                    public void run() { if (!mediaShown) mediaWidget.setVisibility(View.INVISIBLE); }
+                }).start();
+            }
+        }
+
         if (!artKey.equals(lastArtKey)) {
             lastArtKey = artKey;
             if (art != null) {
@@ -1103,7 +1539,7 @@ public class MainActivity extends Activity {
             }
         }
 
-        boolean has = best != null;
+        boolean has = show;
         for (Ctl c : ctlViews) c.setVisibility(has ? View.VISIBLE : View.INVISIBLE);
         if (ctlViews.size() > 1) ctlViews.get(1).setPlaying(playing);
 
@@ -1240,7 +1676,7 @@ public class MainActivity extends Activity {
         String net = netName();
         if (!net.equals(lastNet)) {
             lastNet = net;
-            pills[2].setText(net);
+            pills[3].setText(net);
             layoutPills();
             if (zone == TOP) updateFocus();
         }
@@ -1475,11 +1911,19 @@ public class MainActivity extends Activity {
         if (zone == DOCK) {
             if (dock.isEmpty()) return;
             addEntry("Mover", new Runnable() { public void run() { startMove(); } });
+            final App ia = dock.get(dockIdx);
+            addEntry("Cambiar icono", new Runnable() {
+                public void run() { handler.post(new Runnable() { public void run() { openAppIconMenu(ia); } }); }
+            });
             addEntry("Quitar del dock", new Runnable() { public void run() { removeFromDock(); } });
             addEntry("Desinstalar app", new Runnable() { public void run() { uninstallApp(); } });
         } else {
             if (grid.isEmpty()) return;
             addEntry("Mover", new Runnable() { public void run() { startMove(); } });
+            final App ga = grid.get(gridIdx);
+            addEntry("Cambiar icono", new Runnable() {
+                public void run() { handler.post(new Runnable() { public void run() { openAppIconMenu(ga); } }); }
+            });
             addEntry(dock.size() < 4 ? "Agregar al dock" : "Agregar al dock (reemplaza última)",
                     new Runnable() { public void run() { addToDock(); } });
             addEntry("Ocultar", new Runnable() { public void run() { hideApp(); } });
@@ -1492,14 +1936,20 @@ public class MainActivity extends Activity {
         addEntry("Cambiar fondo", new Runnable() {
             public void run() { handler.post(new Runnable() { public void run() { openWallpaperMenu(); } }); }
         });
-        showPanel(true, 520, 0);
+        if (listenerMissing) {
+            addEntry("Activar lectura de música", new Runnable() {
+                public void run() { fixListener(true); }
+            });
+        }
+        showPanel(true, 560, 0);
     }
 
     void activate() {
         if (zone == TOP) {
             if (topIdx == 0) openWallpaperMenu();
-            else if (topIdx == 1) openMenu();
-            else if (topIdx == 2) openSettings(Settings.ACTION_WIFI_SETTINGS);
+            else if (topIdx == 1) openIconMenu();
+            else if (topIdx == 2) openMenu();
+            else if (topIdx == 3) openSettings(Settings.ACTION_WIFI_SETTINGS);
             else openSettings(Settings.ACTION_SETTINGS);
         } else if (zone == MEDIA) {
             mediaAction();
@@ -1568,7 +2018,7 @@ public class MainActivity extends Activity {
         if (centered) {
             root.addView(panel, lp(w, h, (W - w) / 2, (H - h) / 2));
         } else {
-            FrameLayout.LayoutParams pl = (FrameLayout.LayoutParams) pills[1].getLayoutParams();
+            FrameLayout.LayoutParams pl = (FrameLayout.LayoutParams) pills[2].getLayoutParams();
             int x = Math.min(pl.leftMargin, W - px(40) - w);
             int y = pl.topMargin + pl.height + px(14);
             page.addView(panel, lp(w, h, x, y));
